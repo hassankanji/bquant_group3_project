@@ -1,0 +1,1904 @@
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from scipy.interpolate import PchipInterpolator, interp1d
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+try:
+    import bql
+    HAS_BQL = True
+except Exception:
+    HAS_BQL = False
+
+@dataclass
+class MexicoConfig:
+    valuation_date: pd.Timestamp
+    policy_rate: float
+    tiie_overnight_basis_bps: float
+    standard_move_bps: float
+    forward_window_days: int
+    day_count_basis: int
+    interpolation_method: str
+
+
+config = MexicoConfig(
+    valuation_date=pd.Timestamp("2026-06-25"),
+    policy_rate=6.50,
+    tiie_overnight_basis_bps=25.0,
+    standard_move_bps=25.0,
+    forward_window_days=28,
+    day_count_basis=360,
+    interpolation_method="pchip"
+)
+
+# ============================================================
+# 2. MANUAL MEXICO TIIE 28D SWAP CURVE INPUT
+# ============================================================
+
+manual_curve = pd.DataFrame({
+    "tenor": ["1D", "1M", "2M", "3M", "6M", "9M", "1Y", "18M", "2Y", "3Y", "5Y", "10Y"],
+    "days":  [1,    28,   56,   84,   182,  273,  364,  546,   728,  1092, 1820, 3640],
+    "rate":  [6.50, 6.76, 6.73, 6.70, 6.62, 6.55, 6.48, 6.40, 6.35, 6.30, 6.40, 6.60]
+})
+
+manual_curve["date"] = config.valuation_date + pd.to_timedelta(manual_curve["days"], unit="D")
+
+# ============================================================
+# 3. BANXICO MEETING DATES
+# ============================================================
+
+meeting_dates = pd.to_datetime([
+    "2026-08-06",
+    "2026-09-24",
+    "2026-11-05",
+    "2026-12-17",
+    "2027-02-05",
+    "2027-03-26",
+    "2027-05-14",
+    "2027-06-25",
+])
+
+# ============================================================
+# 4. CURVE MATH
+# ============================================================
+
+def year_fraction(days, basis=360):
+    return np.asarray(days, dtype=float) / basis
+
+
+def zero_rate_to_discount_factor(rate_percent, days, basis=360, compounding="simple"):
+    r = np.asarray(rate_percent, dtype=float) / 100.0
+    t = year_fraction(days, basis)
+
+    if compounding == "simple":
+        return 1.0 / (1.0 + r * t)
+    if compounding == "continuous":
+        return np.exp(-r * t)
+
+    raise ValueError("compounding must be 'simple' or 'continuous'")
+
+
+def build_curve_functions(curve_df, cfg):
+    df = curve_df.copy().sort_values("days").reset_index(drop=True)
+    df["df"] = zero_rate_to_discount_factor(
+        df["rate"],
+        df["days"],
+        basis=cfg.day_count_basis,
+        compounding="simple"
+    )
+    df["log_df"] = np.log(df["df"])
+
+    x = df["days"].values
+    y_logdf = df["log_df"].values
+
+    if cfg.interpolation_method == "pchip":
+        logdf_fn = PchipInterpolator(x, y_logdf, extrapolate=True)
+    elif cfg.interpolation_method == "linear":
+        logdf_fn = interp1d(x, y_logdf, fill_value="extrapolate")
+    else:
+        raise ValueError("interpolation_method must be 'pchip' or 'linear'")
+
+    return df, logdf_fn
+
+
+def forward_rate_from_discount_factors(logdf_fn, start_days, end_days, cfg):
+    start_days = np.asarray(start_days, dtype=float)
+    end_days = np.asarray(end_days, dtype=float)
+
+    df_start = np.exp(logdf_fn(start_days))
+    df_end = np.exp(logdf_fn(end_days))
+    tau = (end_days - start_days) / cfg.day_count_basis
+
+    return ((df_start / df_end - 1.0) / tau) * 100.0
+
+# ============================================================
+# 5. MARKET-IMPLIED BANXICO PATH
+# ============================================================
+
+def build_market_path(curve_df, meeting_dates, cfg):
+    curve_with_dfs, logdf_fn = build_curve_functions(curve_df, cfg)
+
+    meetings = pd.DataFrame({"meeting_date": pd.to_datetime(meeting_dates)})
+    meetings = meetings[meetings["meeting_date"] > cfg.valuation_date].copy()
+    meetings = meetings.sort_values("meeting_date").reset_index(drop=True)
+
+    meetings["forward_start_date"] = meetings["meeting_date"] + pd.Timedelta(days=1)
+    meetings["forward_end_date"] = meetings["forward_start_date"] + pd.Timedelta(days=cfg.forward_window_days)
+
+    meetings["start_days"] = (meetings["forward_start_date"] - cfg.valuation_date).dt.days
+    meetings["end_days"] = (meetings["forward_end_date"] - cfg.valuation_date).dt.days
+
+    meetings["tiie_28d_forward"] = forward_rate_from_discount_factors(
+        logdf_fn,
+        meetings["start_days"],
+        meetings["end_days"],
+        cfg
+    )
+
+    meetings["implied_policy_rate"] = meetings["tiie_28d_forward"] - cfg.tiie_overnight_basis_bps / 100.0
+
+    prev_rates = [cfg.policy_rate] + meetings["implied_policy_rate"].tolist()[:-1]
+    meetings["previous_implied_rate"] = prev_rates
+
+    meetings["implied_rate_delta_bps"] = (
+        meetings["implied_policy_rate"] - meetings["previous_implied_rate"]
+    ) * 100.0
+
+    meetings["number_of_moves"] = meetings["implied_rate_delta_bps"] / cfg.standard_move_bps
+    meetings["pct_hike_cut"] = meetings["number_of_moves"] * 100.0
+
+    meetings["direction"] = np.where(
+        meetings["implied_rate_delta_bps"] > 0, "Hike",
+        np.where(meetings["implied_rate_delta_bps"] < 0, "Cut", "No change")
+    )
+
+    return curve_with_dfs, meetings, logdf_fn
+
+
+curve_with_dfs, market_path, logdf_fn = build_market_path(manual_curve, meeting_dates, config)
+
+
+# ============================================================
+# 6. SCENARIO ENGINE
+# ============================================================
+
+def build_scenario_path(market_path, cfg, scenario_moves_bps):
+    df = market_path.copy()
+
+    if len(scenario_moves_bps) != len(df):
+        raise ValueError("scenario_moves_bps must have one value per meeting.")
+
+    df["scenario_move_bps"] = scenario_moves_bps
+
+    rate = cfg.policy_rate
+    scenario_rates = []
+
+    for move in scenario_moves_bps:
+        rate += move / 100.0
+        scenario_rates.append(rate)
+
+    df["scenario_policy_rate"] = scenario_rates
+    df["market_minus_scenario_bps"] = (
+        df["implied_policy_rate"] - df["scenario_policy_rate"]
+    ) * 100.0
+
+    return df
+
+
+default_scenario_moves_bps = [0, -25, -25, -25, 0, 0, 0, 0]
+scenario_path = build_scenario_path(market_path, config, default_scenario_moves_bps)
+
+# ============================================================
+# 7. FAIR VALUE FROM SCENARIO
+# ============================================================
+
+def scenario_projected_rate_on_date(scenario_path, cfg, date):
+    date = pd.Timestamp(date)
+    past = scenario_path[scenario_path["meeting_date"] < date]
+
+    if past.empty:
+        return cfg.policy_rate
+
+    return float(past.iloc[-1]["scenario_policy_rate"])
+
+
+def scenario_discount_factor(scenario_path, cfg, maturity_days):
+    start = cfg.valuation_date
+    end = cfg.valuation_date + pd.Timedelta(days=int(maturity_days))
+
+    dates = pd.date_range(start=start, end=end, freq="D")
+    if len(dates) <= 1:
+        return 1.0
+
+    df = 1.0
+    for d0, d1 in zip(dates[:-1], dates[1:]):
+        rate_percent = scenario_projected_rate_on_date(scenario_path, cfg, d1)
+        dt = (d1 - d0).days / cfg.day_count_basis
+        df /= (1.0 + (rate_percent / 100.0) * dt)
+
+    return df
+
+
+def fair_zero_rate_from_scenario(scenario_path, cfg, maturity_days):
+    df = scenario_discount_factor(scenario_path, cfg, maturity_days)
+    t = maturity_days / cfg.day_count_basis
+    r = (1.0 / df - 1.0) / t
+    return r * 100.0
+
+
+def market_zero_rate_from_curve(logdf_fn, maturity_days, cfg):
+    df = float(np.exp(logdf_fn(maturity_days)))
+    t = maturity_days / cfg.day_count_basis
+    r = (1.0 / df - 1.0) / t
+    return r * 100.0
+
+
+def fair_value_table(scenario_path, logdf_fn, cfg, maturities):
+    rows = []
+    for tenor, days in maturities:
+        market_rate = market_zero_rate_from_curve(logdf_fn, days, cfg)
+        scenario_rate = fair_zero_rate_from_scenario(scenario_path, cfg, days)
+
+        rows.append({
+            "tenor": tenor,
+            "days": days,
+            "market_curve_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "market_minus_scenario_bps": (market_rate - scenario_rate) * 100.0
+        })
+
+    return pd.DataFrame(rows)
+
+
+fv = fair_value_table(
+    scenario_path,
+    logdf_fn,
+    config,
+    maturities=[("3M", 84), ("6M", 182), ("1Y", 364), ("2Y", 728)]
+)
+
+
+# ============================================================
+# 8. OUTPUT
+# ============================================================
+
+assumptions = pd.DataFrame({
+    "Assumption": [
+        "Policy anchor",
+        "Curve source",
+        "Forward window",
+        "Day count",
+        "Interpolation",
+        "Standard move",
+        "TIIE/overnight basis",
+        "Meeting calendar"
+    ],
+    "Value": [
+        f"{config.policy_rate:.2f}% Banxico target / MXONBR",
+        "Manual placeholder for Mexico TIIE 28D swaps; replace with MXSW/BQL",
+        f"{config.forward_window_days} days",
+        f"ACT/{config.day_count_basis}",
+        config.interpolation_method,
+        f"{config.standard_move_bps:.0f} bp",
+        f"{config.tiie_overnight_basis_bps:.1f} bp",
+        "Manual Banxico dates; replace with Bloomberg calendar if available"
+    ]
+})
+
+print("ASSUMPTIONS")
+display(assumptions)
+
+print("CURVE INPUTS")
+display(manual_curve.round(4))
+
+print("CURVE WITH DISCOUNT FACTORS")
+display(curve_with_dfs.round(6))
+
+print("MARKET IMPLIED PATH")
+display(market_path[[
+    "meeting_date",
+    "tiie_28d_forward",
+    "implied_policy_rate",
+    "implied_rate_delta_bps",
+    "number_of_moves",
+    "pct_hike_cut",
+    "direction"
+]].round(4))
+
+print("SCENARIO PATH")
+display(scenario_path[[
+    "meeting_date",
+    "implied_policy_rate",
+    "implied_rate_delta_bps",
+    "scenario_move_bps",
+    "scenario_policy_rate",
+    "market_minus_scenario_bps"
+]].round(4))
+
+print("SCENARIO FAIR VALUE")
+display(fv.round(4))
+
+
+# ============================================================
+# 9. CHARTS
+# ============================================================
+
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(
+    x=market_path["meeting_date"],
+    y=market_path["implied_policy_rate"],
+    mode="lines+markers",
+    name="Market-implied policy rate"
+))
+
+fig.add_trace(go.Scatter(
+    x=scenario_path["meeting_date"],
+    y=scenario_path["scenario_policy_rate"],
+    mode="lines+markers",
+    name="User scenario policy rate"
+))
+
+fig.update_layout(
+    title="Mexico Banxico Policy Path: Market vs Scenario",
+    xaxis_title="Meeting Date",
+    yaxis_title="Rate (%)",
+    hovermode="x unified",
+    template="plotly_dark"
+)
+
+fig.show()
+
+
+fig2 = go.Figure()
+
+fig2.add_trace(go.Bar(
+    x=market_path["meeting_date"],
+    y=market_path["number_of_moves"],
+    name="# of 25bp moves priced"
+))
+
+fig2.update_layout(
+    title="Mexico: Number of 25bp Hikes/Cuts Priced",
+    xaxis_title="Meeting Date",
+    yaxis_title="# Moves",
+    template="plotly_dark"
+)
+
+fig2.show()
+
+
+fig3 = go.Figure()
+
+fig3.add_trace(go.Bar(
+    x=fv["tenor"],
+    y=fv["market_minus_scenario_bps"],
+    name="Market minus scenario fair value"
+))
+
+fig3.update_layout(
+    title="Scenario Fair Value: Market Rate - Scenario Fair Rate",
+    xaxis_title="Tenor",
+    yaxis_title="Basis points",
+    template="plotly_dark"
+)
+
+fig3.show()
+
+# ============================================================
+# 10. OPTIONAL INTERACTIVE SCENARIO EDITOR
+# ============================================================
+
+move_inputs = []
+for i, row in scenario_path.iterrows():
+    w = widgets.FloatText(
+        value=float(row["scenario_move_bps"]),
+        description=row["meeting_date"].strftime("%Y-%m-%d"),
+        layout=widgets.Layout(width="220px")
+    )
+    move_inputs.append(w)
+
+output_area = widgets.Output()
+
+def rerun_scenario(_=None):
+    with output_area:
+        clear_output()
+        moves = [w.value for w in move_inputs]
+        new_scenario = build_scenario_path(market_path, config, moves)
+        new_fv = fair_value_table(
+            new_scenario,
+            logdf_fn,
+            config,
+            maturities=[("3M", 84), ("6M", 182), ("1Y", 364), ("2Y", 728)]
+        )
+
+        display(new_scenario[[
+            "meeting_date",
+            "implied_policy_rate",
+            "scenario_move_bps",
+            "scenario_policy_rate",
+            "market_minus_scenario_bps"
+        ]].round(4))
+
+        display(new_fv.round(4))
+
+        f = go.Figure()
+        f.add_trace(go.Scatter(
+            x=market_path["meeting_date"],
+            y=market_path["implied_policy_rate"],
+            mode="lines+markers",
+            name="Market-implied"
+        ))
+        f.add_trace(go.Scatter(
+            x=new_scenario["meeting_date"],
+            y=new_scenario["scenario_policy_rate"],
+            mode="lines+markers",
+            name="User scenario"
+        ))
+        f.update_layout(
+            title="Updated Scenario",
+            xaxis_title="Meeting Date",
+            yaxis_title="Rate (%)",
+            template="plotly_dark"
+        )
+        f.show()
+
+run_button = widgets.Button(description="Update Scenario", button_style="success")
+run_button.on_click(rerun_scenario)
+
+display(widgets.HTML("<h3>Editable Scenario Moves, in bps</h3>"))
+display(widgets.VBox(move_inputs + [run_button, output_area]))
+
+rerun_scenario()
+
+#################################################################
+
+import bql
+
+bq = bql.Service()
+
+req = bql.Request(
+    ["MPSWF10J BGN Curncy"],
+    {"px": bq.data.px_last()}
+)
+
+bq.execute(req)[0].df()
+
+import bql
+
+bq = bql.Service()
+
+securities = [
+    "MPSWFC BGN Curncy",   # 3M
+    "MPSWF1A BGN Curncy",  # 1Y
+    "MPSWF2B BGN Curncy",  # 2Y
+    "MPSWF3C BGN Curncy",  # 3Y
+    "MPSWF5E BGN Curncy",  # 5Y
+    "MPSWF7G BGN Curncy",  # 7Y
+    "MPSWF10J BGN Curncy", # 10Y
+    "MPSWF16C BGN Curncy", # 15Y
+    "MPSWF32F BGN Curncy"  # 30Y
+]
+
+req = bql.Request(
+    securities,
+    {
+        "rate": bq.data.px_last(),
+        "maturity": bq.data.maturity(),
+        "name": bq.data.name(),
+        "currency": bq.data.crncy()
+    }
+)
+
+result = bq.execute(req)
+result[0].df()
+
+req = bql.Request(
+    "YCSW0583 Index",
+    {
+        "members": bq.data.members()
+    }
+)
+
+bq.execute(req)[0].df()
+
+securities = list(curve_tickers.values())
+
+req = bql.Request(
+    securities,
+    {
+        "px": bq.data.px_last(),
+        "bid": bq.data.px_bid(),
+        "ask": bq.data.px_ask(),
+        "name": bq.data.name()
+    }
+)
+
+bq.execute(req)[0].df()
+
+curve_tickers = {
+    "1M": "MPSWFA BGN Curncy",
+    "2M": "MPSWFB BGN Curncy",
+    "3M": "MPSWFC BGN Curncy",
+    "6M": "MPSWFF BGN Curncy",
+    "9M": "MPSWFI BGN Curncy",
+    "1Y": "MPSWF1A BGN Curncy",
+    "2Y": "MPSWF2B BGN Curncy",
+    "3Y": "MPSWF3C BGN Curncy",
+    "4Y": "MPSWF4D BGN Curncy",
+    "5Y": "MPSWF5E BGN Curncy",
+    "7Y": "MPSWF7G BGN Curncy",
+    "10Y": "MPSWF10J BGN Curncy",
+    "15Y": "MPSWF16C BGN Curncy",
+    "20Y": "MPSWF21H BGN Curncy",
+    "30Y": "MPSWF32F BGN Curncy",
+}
+
+securities = list(curve_tickers.values())
+
+req = bql.Request(
+    securities,
+    {
+        "px": bq.data.px_last(),
+        "bid": bq.data.px_bid(),
+        "ask": bq.data.px_ask(),
+    }
+)
+
+bq.execute(req)[0].df()
+
+# Mexico Banxico Policy Path + Scenario Fair Value Tool
+# Live MXN TIIE-F RFR / OIS curve -> implied Banxico policy path
+# -> editable policy scenario -> scenario fair value by tenor -> position risk.
+# Assumption note:
+# This is a robust MVP, not final production pricing. It uses live Bloomberg curve node
+# securities and builds a discount curve from quoted rates. Final production version
+# should confirm exact bootstrap conventions
+
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from scipy.interpolate import PchipInterpolator, interp1d
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+import bql
+bq = bql.Service()
+
+
+# ============================================================
+# 1. USER-EXPOSED ASSUMPTIONS
+# ============================================================
+
+@dataclass
+class MexicoConfig:
+    valuation_date: pd.Timestamp
+    policy_rate: float
+    tiie_overnight_basis_bps: float
+    standard_move_bps: float
+    forward_window_days: int
+    day_count_basis: int
+    interpolation_method: str
+
+
+config = MexicoConfig(
+    valuation_date=pd.Timestamp.today().normalize(),
+    policy_rate=6.50,                  # Banxico target / MXONBR
+    tiie_overnight_basis_bps=25.0,     # editable assumption: TIIE/RFR-vs-policy basis
+    standard_move_bps=25.0,            # Mexico usually discussed in 25bp increments
+    forward_window_days=28,            # TIIE 28D / 28-day forward window
+    day_count_basis=360,               # ACT/360
+    interpolation_method="pchip"       # pchip or linear
+)
+
+
+# ============================================================
+# 2. LIVE CURVE TICKERS: MXN TIIE-F RFR Curve / S583
+# ============================================================
+
+curve_tickers = {
+    "1M":  "MPSWFA BGN Curncy",
+    "2M":  "MPSWFB BGN Curncy",
+    "3M":  "MPSWFC BGN Curncy",
+    "6M":  "MPSWFF BGN Curncy",
+    "9M":  "MPSWFI BGN Curncy",
+    "1Y":  "MPSWF1A BGN Curncy",
+    "2Y":  "MPSWF2B BGN Curncy",
+    "3Y":  "MPSWF3C BGN Curncy",
+    "4Y":  "MPSWF4D BGN Curncy",
+    "5Y":  "MPSWF5E BGN Curncy",
+    "7Y":  "MPSWF7G BGN Curncy",
+    "10Y": "MPSWF10J BGN Curncy",
+    "15Y": "MPSWF16C BGN Curncy",
+    "20Y": "MPSWF21H BGN Curncy",
+    "30Y": "MPSWF32F BGN Curncy",
+}
+
+tenor_days = {
+    "1M": 28,
+    "2M": 56,
+    "3M": 84,
+    "6M": 182,
+    "9M": 273,
+    "1Y": 364,
+    "2Y": 728,
+    "3Y": 1092,
+    "4Y": 1456,
+    "5Y": 1820,
+    "7Y": 2548,
+    "10Y": 3640,
+    "15Y": 5460,
+    "20Y": 7280,
+    "30Y": 10920,
+}
+
+
+# ============================================================
+# 3. BANXICO MEETING DATES
+# ============================================================
+#***Confirm these*****
+
+meeting_dates = pd.to_datetime([
+    "2026-08-05",
+    "2026-09-23",
+    "2026-11-05",
+    "2026-12-17",
+    "2027-02-05",
+    "2027-03-26",
+    "2027-05-06",
+    "2027-06-24",
+])
+
+
+# ============================================================
+# 4. LIVE BQL PULL
+# ============================================================
+
+def fetch_live_curve(curve_tickers, tenor_days):
+    securities = list(curve_tickers.values())
+
+    req = bql.Request(
+        securities,
+        {
+            "px": bq.data.px_last()
+        }
+    )
+
+    df_raw = bq.execute(req)[0].df().reset_index()
+
+    # Standardize columns from BQL output
+    # Usually has: ID, DATE, CURRENCY, px
+    id_col = "ID"
+    px_col = "px"
+
+    ticker_to_tenor = {v: k for k, v in curve_tickers.items()}
+
+    df = pd.DataFrame({
+        "ticker": df_raw[id_col],
+        "rate": pd.to_numeric(df_raw[px_col], errors="coerce")
+    })
+
+    df["tenor"] = df["ticker"].map(ticker_to_tenor)
+    df["days"] = df["tenor"].map(tenor_days)
+    df["date"] = config.valuation_date + pd.to_timedelta(df["days"], unit="D")
+    df = df.dropna(subset=["rate", "days"]).sort_values("days").reset_index(drop=True)
+
+    # Add ON anchor at policy rate to stabilize short-end interpolation
+    anchor = pd.DataFrame({
+        "ticker": ["MXONBR Index / policy anchor"],
+        "rate": [config.policy_rate],
+        "tenor": ["ON"],
+        "days": [1],
+        "date": [config.valuation_date + pd.Timedelta(days=1)]
+    })
+
+    df = pd.concat([anchor, df], ignore_index=True).sort_values("days").reset_index(drop=True)
+    return df
+
+
+curve_data = fetch_live_curve(curve_tickers, tenor_days)
+
+
+# ============================================================
+# 5. CURVE CONSTRUCTION
+# ============================================================
+
+def year_fraction(days, basis=360):
+    return np.asarray(days, dtype=float) / basis
+
+
+def zero_rate_to_discount_factor(rate_percent, days, basis=360, compounding="simple"):
+    r = np.asarray(rate_percent, dtype=float) / 100.0
+    t = year_fraction(days, basis)
+
+    if compounding == "simple":
+        return 1.0 / (1.0 + r * t)
+    if compounding == "continuous":
+        return np.exp(-r * t)
+
+    raise ValueError("compounding must be simple or continuous")
+
+
+def build_curve_functions(curve_df, cfg):
+    df = curve_df.copy().sort_values("days").reset_index(drop=True)
+    df = df.dropna(subset=["days", "rate"])
+
+    # MVP approximation: treat node rates as zero/par-ish curve points.
+    # More exact version should bootstrap actual swap cashflows.
+    df["discount_factor"] = zero_rate_to_discount_factor(
+        df["rate"],
+        df["days"],
+        basis=cfg.day_count_basis,
+        compounding="simple"
+    )
+    df["log_discount_factor"] = np.log(df["discount_factor"])
+
+    x = df["days"].values
+    y = df["log_discount_factor"].values
+
+    if cfg.interpolation_method == "pchip":
+        logdf_fn = PchipInterpolator(x, y, extrapolate=True)
+    elif cfg.interpolation_method == "linear":
+        logdf_fn = interp1d(x, y, fill_value="extrapolate")
+    else:
+        raise ValueError("interpolation_method must be pchip or linear")
+
+    return df, logdf_fn
+
+
+def forward_rate_from_discount_factors(logdf_fn, start_days, end_days, cfg):
+    start_days = np.asarray(start_days, dtype=float)
+    end_days = np.asarray(end_days, dtype=float)
+
+    df_start = np.exp(logdf_fn(start_days))
+    df_end = np.exp(logdf_fn(end_days))
+    tau = (end_days - start_days) / cfg.day_count_basis
+
+    return ((df_start / df_end - 1.0) / tau) * 100.0
+
+
+# ============================================================
+# 6. MARKET-IMPLIED BANXICO PATH
+# ============================================================
+
+def build_market_path(curve_df, meeting_dates, cfg):
+    curve_with_dfs, logdf_fn = build_curve_functions(curve_df, cfg)
+
+    meetings = pd.DataFrame({"meeting_date": pd.to_datetime(meeting_dates)})
+    meetings = meetings[meetings["meeting_date"] > cfg.valuation_date].copy()
+    meetings = meetings.sort_values("meeting_date").reset_index(drop=True)
+
+    # Forward begins one day after the meeting; 28-day window for Mexico.
+    meetings["forward_start_date"] = meetings["meeting_date"] + pd.Timedelta(days=1)
+    meetings["forward_end_date"] = meetings["forward_start_date"] + pd.Timedelta(days=cfg.forward_window_days)
+
+    meetings["start_days"] = (meetings["forward_start_date"] - cfg.valuation_date).dt.days
+    meetings["end_days"] = (meetings["forward_end_date"] - cfg.valuation_date).dt.days
+
+    meetings["tiie_28d_forward"] = forward_rate_from_discount_factors(
+        logdf_fn,
+        meetings["start_days"],
+        meetings["end_days"],
+        cfg
+    )
+
+    # Exposed basis assumption: translate curve forward into policy-equivalent path.
+    meetings["implied_policy_rate"] = meetings["tiie_28d_forward"] - cfg.tiie_overnight_basis_bps / 100.0
+
+    previous_rates = [cfg.policy_rate] + meetings["implied_policy_rate"].tolist()[:-1]
+    meetings["previous_implied_rate"] = previous_rates
+
+    meetings["implied_rate_delta_bps"] = (
+        meetings["implied_policy_rate"] - meetings["previous_implied_rate"]
+    ) * 100.0
+
+    meetings["number_of_25bp_moves"] = meetings["implied_rate_delta_bps"] / cfg.standard_move_bps
+    meetings["pct_hike_cut"] = meetings["number_of_25bp_moves"] * 100.0
+
+    meetings["direction"] = np.where(
+        meetings["implied_rate_delta_bps"] > 0, "Hike",
+        np.where(meetings["implied_rate_delta_bps"] < 0, "Cut", "No change")
+    )
+
+    return curve_with_dfs, meetings, logdf_fn
+
+
+curve_with_dfs, market_path, logdf_fn = build_market_path(curve_data, meeting_dates, config)
+
+
+# ============================================================
+# 7. USER SCENARIO ENGINE
+# ============================================================
+
+def build_scenario_path(market_path, cfg, scenario_moves_bps):
+    df = market_path.copy()
+
+    if len(scenario_moves_bps) != len(df):
+        raise ValueError("scenario_moves_bps must have one value per meeting.")
+
+    df["scenario_move_bps"] = scenario_moves_bps
+
+    rate = cfg.policy_rate
+    rates = []
+
+    for move in scenario_moves_bps:
+        rate += move / 100.0
+        rates.append(rate)
+
+    df["scenario_policy_rate"] = rates
+    df["market_minus_scenario_bps"] = (
+        df["implied_policy_rate"] - df["scenario_policy_rate"]
+    ) * 100.0
+
+    return df
+
+
+# Default scenario: no change at first meeting, then cuts.
+default_scenario_moves_bps = [0, -25, -25, -25, 0, 0, 0, 0]
+default_scenario_moves_bps = default_scenario_moves_bps[:len(market_path)]
+
+scenario_path = build_scenario_path(market_path, config, default_scenario_moves_bps)
+
+
+# ============================================================
+# 8. FAIR VALUE / POSITION RISK
+# ============================================================
+
+def scenario_projected_rate_on_date(scenario_path, cfg, date):
+    date = pd.Timestamp(date)
+    past = scenario_path[scenario_path["meeting_date"] < date]
+
+    if past.empty:
+        return cfg.policy_rate
+
+    return float(past.iloc[-1]["scenario_policy_rate"])
+
+
+def scenario_discount_factor(scenario_path, cfg, maturity_days):
+    start = cfg.valuation_date
+    end = cfg.valuation_date + pd.Timedelta(days=int(maturity_days))
+
+    dates = pd.date_range(start=start, end=end, freq="D")
+
+    df = 1.0
+    for d0, d1 in zip(dates[:-1], dates[1:]):
+        r = scenario_projected_rate_on_date(scenario_path, cfg, d1) / 100.0
+        dt = (d1 - d0).days / cfg.day_count_basis
+        df /= (1.0 + r * dt)
+
+    return df
+
+
+def scenario_fair_rate(scenario_path, cfg, maturity_days):
+    df = scenario_discount_factor(scenario_path, cfg, maturity_days)
+    t = maturity_days / cfg.day_count_basis
+    return ((1.0 / df - 1.0) / t) * 100.0
+
+
+def market_rate_from_curve(logdf_fn, maturity_days, cfg):
+    df = float(np.exp(logdf_fn(maturity_days)))
+    t = maturity_days / cfg.day_count_basis
+    return ((1.0 / df - 1.0) / t) * 100.0
+
+
+def fair_value_table(scenario_path, logdf_fn, cfg, maturities, position="Long Payer", dv01_per_bp=10000):
+    rows = []
+
+    for tenor, days in maturities:
+        market_rate = market_rate_from_curve(logdf_fn, days, cfg)
+        scenario_rate = scenario_fair_rate(scenario_path, cfg, days)
+        scenario_minus_market_bps = (scenario_rate - market_rate) * 100.0
+
+        # Simple sign convention:
+        # Long payer benefits when fair rates rise.
+        # Long receiver benefits when fair rates fall.
+        if position == "Long Payer":
+            estimated_pnl = scenario_minus_market_bps * dv01_per_bp
+        elif position == "Long Receiver":
+            estimated_pnl = -scenario_minus_market_bps * dv01_per_bp
+        else:
+            estimated_pnl = np.nan
+
+        rows.append({
+            "tenor": tenor,
+            "days": days,
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": scenario_minus_market_bps,
+            "position": position,
+            "dv01_per_bp": dv01_per_bp,
+            "estimated_pnl": estimated_pnl
+        })
+
+    return pd.DataFrame(rows)
+
+
+risk_maturities = [
+    ("1Y", 364),
+    ("2Y", 728),
+    ("3Y", 1092),
+    ("5Y", 1820),
+    ("7Y", 2548),
+    ("10Y", 3640),
+]
+
+fv = fair_value_table(
+    scenario_path,
+    logdf_fn,
+    config,
+    risk_maturities,
+    position="Long Payer",
+    dv01_per_bp=10000
+)
+
+
+# ============================================================
+# 9. INITIAL OUTPUT
+# ============================================================
+
+assumptions = pd.DataFrame({
+    "Assumption": [
+        "Curve source",
+        "Policy anchor",
+        "Valuation date",
+        "Forward window",
+        "Day count",
+        "Interpolation",
+        "Standard move",
+        "TIIE/RFR-to-policy basis",
+        "Meeting calendar",
+        "Fair value method",
+    ],
+    "Value": [
+        "Live BQL pull of MPSWF* BGN Curncy curve nodes / MXN TIIE-F RFR",
+        f"{config.policy_rate:.2f}% Banxico target / MXONBR",
+        str(config.valuation_date.date()),
+        f"{config.forward_window_days} days",
+        f"ACT/{config.day_count_basis}",
+        config.interpolation_method,
+        f"{config.standard_move_bps:.0f} bp",
+        f"{config.tiie_overnight_basis_bps:.1f} bp",
+        "Manual Banxico dates from ECO/ECOS; can automate later",
+        "Discount-factor-based scenario fair rate, not simple average",
+    ]
+})
+
+print("ASSUMPTIONS")
+display(assumptions)
+
+print("LIVE CURVE")
+display(curve_data.round(6))
+
+print("MARKET IMPLIED BANXICO PATH")
+display(market_path[[
+    "meeting_date",
+    "forward_start_date",
+    "forward_end_date",
+    "tiie_28d_forward",
+    "implied_policy_rate",
+    "implied_rate_delta_bps",
+    "number_of_25bp_moves",
+    "pct_hike_cut",
+    "direction"
+]].round(4))
+
+print("DEFAULT SCENARIO PATH")
+display(scenario_path[[
+    "meeting_date",
+    "implied_policy_rate",
+    "implied_rate_delta_bps",
+    "scenario_move_bps",
+    "scenario_policy_rate",
+    "market_minus_scenario_bps"
+]].round(4))
+
+print("DEFAULT FAIR VALUE / RISK")
+display(fv.round(4))
+
+
+# ============================================================
+# 10. CHARTS
+# ============================================================
+
+def plot_main_charts(market_path, scenario_path, fv):
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=market_path["meeting_date"],
+        y=market_path["implied_policy_rate"],
+        mode="lines+markers",
+        name="Market-implied policy path"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=scenario_path["meeting_date"],
+        y=scenario_path["scenario_policy_rate"],
+        mode="lines+markers",
+        name="User scenario path"
+    ))
+
+    fig.update_layout(
+        title="Mexico Banxico Policy Path: Market vs Scenario",
+        xaxis_title="Meeting Date",
+        yaxis_title="Policy Rate (%)",
+        hovermode="x unified",
+        template="plotly_dark"
+    )
+
+    fig.show()
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(
+        x=market_path["meeting_date"],
+        y=market_path["number_of_25bp_moves"],
+        name="# 25bp moves priced"
+    ))
+    fig2.update_layout(
+        title="Market-Implied Number of 25bp Moves",
+        xaxis_title="Meeting Date",
+        yaxis_title="# Moves",
+        template="plotly_dark"
+    )
+    fig2.show()
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Bar(
+        x=fv["tenor"],
+        y=fv["scenario_minus_market_bps"],
+        name="Scenario fair rate - market"
+    ))
+    fig3.update_layout(
+        title="Scenario Fair Value by Tenor",
+        xaxis_title="Tenor",
+        yaxis_title="bps",
+        template="plotly_dark"
+    )
+    fig3.show()
+
+
+plot_main_charts(market_path, scenario_path, fv)
+
+
+# ============================================================
+# 11. INTERACTIVE SCENARIO + POSITION UI
+# ============================================================
+
+move_inputs = []
+for _, row in market_path.iterrows():
+    move_inputs.append(
+        widgets.FloatText(
+            value=0.0,
+            description=row["meeting_date"].strftime("%Y-%m-%d"),
+            layout=widgets.Layout(width="230px")
+        )
+    )
+
+basis_input = widgets.FloatText(
+    value=config.tiie_overnight_basis_bps,
+    description="Basis bps:",
+    layout=widgets.Layout(width="230px")
+)
+
+position_dropdown = widgets.Dropdown(
+    options=["Long Payer", "Long Receiver"],
+    value="Long Payer",
+    description="Position:",
+    layout=widgets.Layout(width="250px")
+)
+
+dv01_input = widgets.FloatText(
+    value=10000,
+    description="DV01/bp:",
+    layout=widgets.Layout(width="230px")
+)
+
+run_button = widgets.Button(description="Update Scenario", button_style="success")
+refresh_button = widgets.Button(description="Refresh Live Curve", button_style="info")
+
+output_area = widgets.Output()
+
+def calculate_and_display():
+    global curve_data, curve_with_dfs, market_path, logdf_fn
+
+    cfg = MexicoConfig(
+        valuation_date=config.valuation_date,
+        policy_rate=config.policy_rate,
+        tiie_overnight_basis_bps=float(basis_input.value),
+        standard_move_bps=config.standard_move_bps,
+        forward_window_days=config.forward_window_days,
+        day_count_basis=config.day_count_basis,
+        interpolation_method=config.interpolation_method,
+    )
+
+    curve_with_dfs, mp, ldf = build_market_path(curve_data, meeting_dates, cfg)
+
+    moves = [float(w.value) for w in move_inputs[:len(mp)]]
+    sp = build_scenario_path(mp, cfg, moves)
+
+    new_fv = fair_value_table(
+        sp,
+        ldf,
+        cfg,
+        risk_maturities,
+        position=position_dropdown.value,
+        dv01_per_bp=float(dv01_input.value)
+    )
+
+    display(mp[[
+        "meeting_date",
+        "tiie_28d_forward",
+        "implied_policy_rate",
+        "implied_rate_delta_bps",
+        "number_of_25bp_moves",
+        "direction"
+    ]].round(4))
+
+    display(sp[[
+        "meeting_date",
+        "implied_policy_rate",
+        "scenario_move_bps",
+        "scenario_policy_rate",
+        "market_minus_scenario_bps"
+    ]].round(4))
+
+    display(new_fv.round(4))
+
+    plot_main_charts(mp, sp, new_fv)
+
+def on_run(_):
+    with output_area:
+        clear_output()
+        calculate_and_display()
+
+def on_refresh(_):
+    global curve_data
+    with output_area:
+        clear_output()
+        curve_data = fetch_live_curve(curve_tickers, tenor_days)
+        print("Live curve refreshed.")
+        display(curve_data.round(6))
+        calculate_and_display()
+
+run_button.on_click(on_run)
+refresh_button.on_click(on_refresh)
+
+display(widgets.HTML("<h3>Mexico Banxico Scenario Tool</h3>"))
+display(widgets.HTML("<b>Enter user scenario moves in bps. Example: +25 = hike, -25 = cut, 0 = hold.</b>"))
+display(widgets.VBox([
+    widgets.HTML("<b>Scenario Moves by Meeting</b>"),
+    widgets.VBox(move_inputs),
+    widgets.HBox([basis_input, position_dropdown, dv01_input]),
+    widgets.HBox([run_button, refresh_button]),
+    output_area
+]))
+
+with output_area:
+    calculate_and_display()
+
+
+
+# ============================================================
+# Global EM Implied Monetary Policy Pricer
+# Mexico/Banxico
+# ============================================================
+# MXN TIIE-F RFR curve / S583 curve members.
+
+# 1. Pulls live MXN curve points from BQL.
+# 2. Builds an interpolated discount curve.
+# 3. Derives 28-day forwards after each Banxico meeting.
+# 4. Converts forwards into market-implied meeting moves.
+# 5. Exposes assumptions: basis, interpolation, move size, forward window, DV01.
+# 6. Lets users enter policy path scenarios by meeting.
+# 7. Computes scenario fair value by tenor.
+# 8. Shows trade/risk output for payer/receiver positions.
+# 9. Provides Research / Sales / Trading summary panels.
+#
+# Important:
+# This is a strong MVP. Final production pricing should confirm exact
+# Bloomberg curve bootstrapping conventions, calendars, basis treatment,
+# swap cashflow schedules, and desk-specific DV01/PV01 logic.
+
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from scipy.interpolate import PchipInterpolator, interp1d
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import display, clear_output, Markdown
+
+import bql
+bq = bql.Service()
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+@dataclass
+class PolicyPricerConfig:
+    country: str
+    central_bank: str
+    valuation_date: pd.Timestamp
+    policy_rate: float
+    policy_anchor_ticker: str
+    basis_bps: float
+    standard_move_bps: float
+    forward_window_days: int
+    day_count_basis: int
+    interpolation_method: str
+
+
+config = PolicyPricerConfig(
+    country="Mexico",
+    central_bank="Banxico",
+    valuation_date=pd.Timestamp.today().normalize(),
+    policy_rate=6.50,
+    policy_anchor_ticker="MXONBR Index",
+    basis_bps=25.0,                  # exposed assumption: TIIE-F/RFR to policy basis
+    standard_move_bps=25.0,
+    forward_window_days=28,
+    day_count_basis=360,
+    interpolation_method="pchip"
+)
+
+
+# ============================================================
+# 2. MEXICO CURVE SOURCE
+# ============================================================
+
+curve_tickers = {
+    "1M":  "MPSWFA BGN Curncy",
+    "2M":  "MPSWFB BGN Curncy",
+    "3M":  "MPSWFC BGN Curncy",
+    "6M":  "MPSWFF BGN Curncy",
+    "9M":  "MPSWFI BGN Curncy",
+    "1Y":  "MPSWF1A BGN Curncy",
+    "2Y":  "MPSWF2B BGN Curncy",
+    "3Y":  "MPSWF3C BGN Curncy",
+    "4Y":  "MPSWF4D BGN Curncy",
+    "5Y":  "MPSWF5E BGN Curncy",
+    "7Y":  "MPSWF7G BGN Curncy",
+    "10Y": "MPSWF10J BGN Curncy",
+    "15Y": "MPSWF16C BGN Curncy",
+    "20Y": "MPSWF21H BGN Curncy",
+    "30Y": "MPSWF32F BGN Curncy",
+}
+
+tenor_days = {
+    "1M": 28,
+    "2M": 56,
+    "3M": 84,
+    "6M": 182,
+    "9M": 273,
+    "1Y": 364,
+    "2Y": 728,
+    "3Y": 1092,
+    "4Y": 1456,
+    "5Y": 1820,
+    "7Y": 2548,
+    "10Y": 3640,
+    "15Y": 5460,
+    "20Y": 7280,
+    "30Y": 10920,
+}
+
+
+# ============================================================
+# 3. BANXICO MEETING DATES
+# ============================================================
+# Replace/extend with Bloomberg ECO/ECOS when available.
+# Keep the manual list visible because "meeting calendar" is one of the
+# assumptions users should be able to inspect/change.
+
+meeting_dates = pd.to_datetime([
+    "2026-08-05",
+    "2026-09-23",
+    "2026-11-05",
+    "2026-12-17",
+    "2027-02-05",
+    "2027-03-26",
+    "2027-05-06",
+    "2027-06-24",
+])
+
+
+# ============================================================
+# 4. LIVE BQL PULL
+# ============================================================
+
+def fetch_policy_rate(policy_ticker, fallback_rate):
+    """Try to pull policy anchor. If unavailable, use fallback."""
+    try:
+        req = bql.Request([policy_ticker], {"px": bq.data.px_last()})
+        raw = bq.execute(req)[0].df().reset_index()
+        value = pd.to_numeric(raw["px"].iloc[0], errors="coerce")
+        if pd.notna(value):
+            return float(value)
+    except Exception:
+        pass
+    return fallback_rate
+
+
+def fetch_live_curve(curve_tickers, tenor_days, cfg):
+    securities = list(curve_tickers.values())
+
+    req = bql.Request(
+        securities,
+        {"px": bq.data.px_last()}
+    )
+    raw = bq.execute(req)[0].df().reset_index()
+
+    ticker_to_tenor = {v: k for k, v in curve_tickers.items()}
+
+    df = pd.DataFrame({
+        "ticker": raw["ID"],
+        "rate": pd.to_numeric(raw["px"], errors="coerce")
+    })
+    df["tenor"] = df["ticker"].map(ticker_to_tenor)
+    df["days"] = df["tenor"].map(tenor_days)
+    df["date"] = cfg.valuation_date + pd.to_timedelta(df["days"], unit="D")
+    df = df.dropna(subset=["rate", "days"]).sort_values("days").reset_index(drop=True)
+
+    # Anchor short end with policy rate.
+    anchor = pd.DataFrame({
+        "ticker": [cfg.policy_anchor_ticker],
+        "rate": [cfg.policy_rate],
+        "tenor": ["ON"],
+        "days": [1],
+        "date": [cfg.valuation_date + pd.Timedelta(days=1)]
+    })
+    return pd.concat([anchor, df], ignore_index=True).sort_values("days").reset_index(drop=True)
+
+
+# ============================================================
+# 5. CURVE MATH
+# ============================================================
+
+def year_fraction(days, basis=360):
+    return np.asarray(days, dtype=float) / basis
+
+
+def zero_rate_to_discount_factor(rate_percent, days, basis=360, compounding="simple"):
+    r = np.asarray(rate_percent, dtype=float) / 100.0
+    t = year_fraction(days, basis)
+
+    if compounding == "simple":
+        return 1.0 / (1.0 + r * t)
+    if compounding == "continuous":
+        return np.exp(-r * t)
+    raise ValueError("compounding must be simple or continuous")
+
+
+def build_curve_functions(curve_df, cfg):
+    df = curve_df.copy().sort_values("days").reset_index(drop=True)
+    df = df.dropna(subset=["days", "rate"])
+
+    # MVP approximation: treats quoted curve nodes as zero/par-ish points.
+    # Desk version should align to Bloomberg bootstrapping conventions.
+    df["discount_factor"] = zero_rate_to_discount_factor(
+        df["rate"], df["days"], basis=cfg.day_count_basis, compounding="simple"
+    )
+    df["log_discount_factor"] = np.log(df["discount_factor"])
+
+    x = df["days"].values
+    y = df["log_discount_factor"].values
+
+    if cfg.interpolation_method == "pchip":
+        logdf_fn = PchipInterpolator(x, y, extrapolate=True)
+    elif cfg.interpolation_method == "linear":
+        logdf_fn = interp1d(x, y, fill_value="extrapolate")
+    else:
+        raise ValueError("interpolation_method must be 'pchip' or 'linear'")
+
+    return df, logdf_fn
+
+
+def forward_rate_from_discount_factors(logdf_fn, start_days, end_days, cfg):
+    start_days = np.asarray(start_days, dtype=float)
+    end_days = np.asarray(end_days, dtype=float)
+    df_start = np.exp(logdf_fn(start_days))
+    df_end = np.exp(logdf_fn(end_days))
+    tau = (end_days - start_days) / cfg.day_count_basis
+    return ((df_start / df_end - 1.0) / tau) * 100.0
+
+
+# ============================================================
+# 6. MARKET IMPLIED PATH
+# ============================================================
+
+def build_market_path(curve_df, meeting_dates, cfg):
+    curve_with_dfs, logdf_fn = build_curve_functions(curve_df, cfg)
+
+    meetings = pd.DataFrame({"meeting_date": pd.to_datetime(meeting_dates)})
+    meetings = meetings[meetings["meeting_date"] > cfg.valuation_date].copy()
+    meetings = meetings.sort_values("meeting_date").reset_index(drop=True)
+
+    meetings["forward_start_date"] = meetings["meeting_date"] + pd.Timedelta(days=1)
+    meetings["forward_end_date"] = meetings["forward_start_date"] + pd.Timedelta(days=cfg.forward_window_days)
+    meetings["start_days"] = (meetings["forward_start_date"] - cfg.valuation_date).dt.days
+    meetings["end_days"] = (meetings["forward_end_date"] - cfg.valuation_date).dt.days
+
+    meetings["curve_28d_forward"] = forward_rate_from_discount_factors(
+        logdf_fn, meetings["start_days"], meetings["end_days"], cfg
+    )
+
+    # Exposed basis assumption.
+    meetings["implied_policy_rate"] = meetings["curve_28d_forward"] - cfg.basis_bps / 100.0
+
+    previous_rates = [cfg.policy_rate] + meetings["implied_policy_rate"].tolist()[:-1]
+    meetings["previous_implied_rate"] = previous_rates
+
+    meetings["implied_rate_delta_bps"] = (
+        meetings["implied_policy_rate"] - meetings["previous_implied_rate"]
+    ) * 100.0
+
+    meetings["number_of_25bp_moves"] = meetings["implied_rate_delta_bps"] / cfg.standard_move_bps
+    meetings["pct_hike_cut"] = meetings["number_of_25bp_moves"] * 100.0
+
+    meetings["direction"] = np.where(
+        meetings["implied_rate_delta_bps"] > 0, "Hike",
+        np.where(meetings["implied_rate_delta_bps"] < 0, "Cut", "No change")
+    )
+    return curve_with_dfs, meetings, logdf_fn
+
+
+# ============================================================
+# 7. SCENARIO ENGINE
+# ============================================================
+
+def build_scenario_path(market_path, cfg, scenario_moves_bps):
+    df = market_path.copy()
+    if len(scenario_moves_bps) != len(df):
+        raise ValueError("scenario_moves_bps must have one value per meeting.")
+
+    df["scenario_move_bps"] = scenario_moves_bps
+    rate = cfg.policy_rate
+    rates = []
+    for move in scenario_moves_bps:
+        rate += move / 100.0
+        rates.append(rate)
+
+    df["scenario_policy_rate"] = rates
+    df["market_minus_scenario_bps"] = (
+        df["implied_policy_rate"] - df["scenario_policy_rate"]
+    ) * 100.0
+    return df
+
+
+def make_preset_scenario(market_path, preset):
+    n = len(market_path)
+    if preset == "Market":
+        return market_path["implied_rate_delta_bps"].round(0).tolist()
+    if preset == "Hold":
+        return [0.0] * n
+    if preset == "Dovish":
+        base = [-25.0, -25.0, -25.0, -25.0] + [0.0] * max(0, n - 4)
+        return base[:n]
+    if preset == "Hawkish":
+        base = [25.0, 0.0, 0.0, -25.0] + [0.0] * max(0, n - 4)
+        return base[:n]
+    return [0.0] * n
+
+
+# ============================================================
+# 8. SCENARIO FAIR VALUE / RISK
+# ============================================================
+
+def scenario_projected_rate_on_date(scenario_path, cfg, date):
+    date = pd.Timestamp(date)
+    past = scenario_path[scenario_path["meeting_date"] < date]
+    if past.empty:
+        return cfg.policy_rate
+    return float(past.iloc[-1]["scenario_policy_rate"])
+
+
+def scenario_discount_factor(scenario_path, cfg, maturity_days):
+    start = cfg.valuation_date
+    end = cfg.valuation_date + pd.Timedelta(days=int(maturity_days))
+    dates = pd.date_range(start=start, end=end, freq="D")
+
+    df = 1.0
+    for d0, d1 in zip(dates[:-1], dates[1:]):
+        r = scenario_projected_rate_on_date(scenario_path, cfg, d1) / 100.0
+        dt = (d1 - d0).days / cfg.day_count_basis
+        df /= (1.0 + r * dt)
+    return df
+
+
+def scenario_fair_rate(scenario_path, cfg, maturity_days):
+    df = scenario_discount_factor(scenario_path, cfg, maturity_days)
+    t = maturity_days / cfg.day_count_basis
+    return ((1.0 / df - 1.0) / t) * 100.0
+
+
+def market_rate_from_curve(logdf_fn, maturity_days, cfg):
+    df = float(np.exp(logdf_fn(maturity_days)))
+    t = maturity_days / cfg.day_count_basis
+    return ((1.0 / df - 1.0) / t) * 100.0
+
+
+def fair_value_table(scenario_path, logdf_fn, cfg, maturities, position="Long Payer", dv01_per_bp=10000):
+    rows = []
+    for tenor, days in maturities:
+        market_rate = market_rate_from_curve(logdf_fn, days, cfg)
+        scenario_rate = scenario_fair_rate(scenario_path, cfg, days)
+        scenario_minus_market_bps = (scenario_rate - market_rate) * 100.0
+
+        if position == "Long Payer":
+            estimated_pnl = scenario_minus_market_bps * dv01_per_bp
+        elif position == "Long Receiver":
+            estimated_pnl = -scenario_minus_market_bps * dv01_per_bp
+        else:
+            estimated_pnl = np.nan
+
+        trade_bias = "Pay fixed" if scenario_minus_market_bps > 0 else "Receive fixed"
+        if abs(scenario_minus_market_bps) < 1:
+            trade_bias = "Close to fair"
+
+        rows.append({
+            "tenor": tenor,
+            "days": days,
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": scenario_minus_market_bps,
+            "trade_bias_from_scenario": trade_bias,
+            "position": position,
+            "dv01_per_bp": dv01_per_bp,
+            "estimated_pnl": estimated_pnl
+        })
+    return pd.DataFrame(rows)
+
+
+risk_maturities = [
+    ("1Y", 364),
+    ("2Y", 728),
+    ("3Y", 1092),
+    ("5Y", 1820),
+    ("7Y", 2548),
+    ("10Y", 3640),
+]
+
+
+# ============================================================
+# 9. SUMMARY PANELS
+# ============================================================
+
+def make_research_summary(market_path, scenario_path, fv):
+    total_market_bps = (market_path["implied_policy_rate"].iloc[-1] - market_path["implied_policy_rate"].iloc[0]) * 100
+    total_scenario_bps = (scenario_path["scenario_policy_rate"].iloc[-1] - scenario_path["scenario_policy_rate"].iloc[0]) * 100
+    biggest = fv.iloc[fv["scenario_minus_market_bps"].abs().argmax()]
+    return pd.DataFrame({
+        "Research Question": [
+            "What is the market pricing?",
+            "What does my scenario imply?",
+            "Where is the largest gap?"
+        ],
+        "Answer": [
+            f"Market path changes by {total_market_bps:.1f} bp across displayed meetings.",
+            f"Scenario path changes by {total_scenario_bps:.1f} bp across displayed meetings.",
+            f"{biggest['tenor']} differs by {biggest['scenario_minus_market_bps']:.1f} bp vs market."
+        ]
+    })
+
+
+def make_sales_summary(market_path, scenario_path, fv):
+    best = fv.iloc[fv["scenario_minus_market_bps"].abs().argmax()]
+    return pd.DataFrame({
+        "Client Talking Point": [
+            "Market-implied path",
+            "House/user scenario",
+            "Most affected tenor"
+        ],
+        "Message": [
+            "The live curve is translated into meeting-by-meeting Banxico pricing.",
+            "Users can replace the market path with a specific policy sequence.",
+            f"{best['tenor']} has the largest scenario gap: {best['scenario_minus_market_bps']:.1f} bp."
+        ]
+    })
+
+
+def make_trading_summary(fv, position):
+    rows = []
+    for _, row in fv.iterrows():
+        rows.append({
+            "Tenor": row["tenor"],
+            "Scenario Gap (bp)": row["scenario_minus_market_bps"],
+            "Trade Bias": row["trade_bias_from_scenario"],
+            f"Estimated P&L for {position}": row["estimated_pnl"],
+        })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 10. PLOTTING
+# ============================================================
+
+def plot_all(market_path, scenario_path, fv):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=market_path["meeting_date"],
+        y=market_path["implied_policy_rate"],
+        mode="lines+markers",
+        name="Market-implied path"
+    ))
+    fig.add_trace(go.Scatter(
+        x=scenario_path["meeting_date"],
+        y=scenario_path["scenario_policy_rate"],
+        mode="lines+markers",
+        name="User scenario"
+    ))
+    fig.update_layout(
+        title="Mexico Banxico Policy Path: Market vs Scenario",
+        xaxis_title="Meeting Date",
+        yaxis_title="Policy Rate (%)",
+        hovermode="x unified",
+        template="plotly_dark"
+    )
+    fig.show()
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(
+        x=market_path["meeting_date"],
+        y=market_path["number_of_25bp_moves"],
+        name="# 25bp moves priced"
+    ))
+    fig2.update_layout(
+        title="Market-Implied Number of 25bp Moves by Meeting",
+        xaxis_title="Meeting Date",
+        yaxis_title="# 25bp moves",
+        template="plotly_dark"
+    )
+    fig2.show()
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Bar(
+        x=fv["tenor"],
+        y=fv["scenario_minus_market_bps"],
+        name="Scenario fair rate - market"
+    ))
+    fig3.update_layout(
+        title="Scenario Fair Value by Tenor",
+        xaxis_title="Tenor",
+        yaxis_title="Basis points",
+        template="plotly_dark"
+    )
+    fig3.show()
+
+
+# ============================================================
+# 11. INITIALIZE LIVE DATA
+# ============================================================
+
+config.policy_rate = fetch_policy_rate(config.policy_anchor_ticker, config.policy_rate)
+curve_data = fetch_live_curve(curve_tickers, tenor_days, config)
+curve_with_dfs, market_path, logdf_fn = build_market_path(curve_data, meeting_dates, config)
+default_moves = make_preset_scenario(market_path, "Hold")
+scenario_path = build_scenario_path(market_path, config, default_moves)
+fv = fair_value_table(scenario_path, logdf_fn, config, risk_maturities)
+
+
+# ============================================================
+# 12. MAIN UI
+# ============================================================
+
+display(Markdown("""
+# Mexico Banxico Policy Path Tool
+
+**Workflow:** live MXN curve → implied Banxico path → editable policy scenario → fair value by tenor → position risk.
+
+- market-specific instruments,
+- meeting-date pricing,
+- visible assumptions,
+- scenario entry,
+- fair value against scenarios,
+"""))
+
+assumptions_box = widgets.Output()
+tables_box = widgets.Output()
+charts_box = widgets.Output()
+summary_box = widgets.Output()
+
+basis_input = widgets.FloatText(
+    value=config.basis_bps,
+    description="Basis bps:",
+    layout=widgets.Layout(width="230px")
+)
+
+policy_input = widgets.FloatText(
+    value=config.policy_rate,
+    description="Policy rate:",
+    layout=widgets.Layout(width="230px")
+)
+
+move_size_input = widgets.FloatText(
+    value=config.standard_move_bps,
+    description="Move bp:",
+    layout=widgets.Layout(width="230px")
+)
+
+position_dropdown = widgets.Dropdown(
+    options=["Long Payer", "Long Receiver"],
+    value="Long Payer",
+    description="Position:",
+    layout=widgets.Layout(width="260px")
+)
+
+dv01_input = widgets.FloatText(
+    value=10000,
+    description="DV01/bp:",
+    layout=widgets.Layout(width="230px")
+)
+
+scenario_preset = widgets.Dropdown(
+    options=["Hold", "Market", "Dovish", "Hawkish", "Custom"],
+    value="Hold",
+    description="Scenario:",
+    layout=widgets.Layout(width="260px")
+)
+
+move_inputs = []
+for _, row in market_path.iterrows():
+    move_inputs.append(
+        widgets.FloatText(
+            value=0.0,
+            description=row["meeting_date"].strftime("%Y-%m-%d"),
+            layout=widgets.Layout(width="230px")
+        )
+    )
+
+run_button = widgets.Button(description="Update", button_style="success")
+refresh_button = widgets.Button(description="Refresh Live Curve", button_style="info")
+
+
+def current_config():
+    return PolicyPricerConfig(
+        country=config.country,
+        central_bank=config.central_bank,
+        valuation_date=config.valuation_date,
+        policy_rate=float(policy_input.value),
+        policy_anchor_ticker=config.policy_anchor_ticker,
+        basis_bps=float(basis_input.value),
+        standard_move_bps=float(move_size_input.value),
+        forward_window_days=config.forward_window_days,
+        day_count_basis=config.day_count_basis,
+        interpolation_method=config.interpolation_method
+    )
+
+
+def set_move_inputs_from_preset(preset, mp):
+    if preset == "Custom":
+        return
+    moves = make_preset_scenario(mp, preset)
+    for w, m in zip(move_inputs, moves):
+        w.value = float(m)
+
+
+def render_all(refresh_curve=False):
+    global curve_data
+
+    cfg = current_config()
+    if refresh_curve:
+        cfg.policy_rate = fetch_policy_rate(cfg.policy_anchor_ticker, cfg.policy_rate)
+        policy_input.value = cfg.policy_rate
+        curve_data = fetch_live_curve(curve_tickers, tenor_days, cfg)
+
+    curve_with_dfs_local, mp, ldf = build_market_path(curve_data, meeting_dates, cfg)
+
+    set_move_inputs_from_preset(scenario_preset.value, mp)
+    moves = [float(w.value) for w in move_inputs[:len(mp)]]
+    sp = build_scenario_path(mp, cfg, moves)
+
+    fv_local = fair_value_table(
+        sp,
+        ldf,
+        cfg,
+        risk_maturities,
+        position=position_dropdown.value,
+        dv01_per_bp=float(dv01_input.value)
+    )
+
+    with assumptions_box:
+        clear_output()
+        assumptions = pd.DataFrame({
+            "Assumption": [
+                "Country",
+                "Curve source",
+                "Policy anchor",
+                "Valuation date",
+                "Forward window",
+                "Day count",
+                "Interpolation",
+                "Standard move",
+                "Basis",
+                "Scenario preset",
+                "Fair value method"
+            ],
+            "Value": [
+                cfg.country,
+                "Live BQL: MPSWF* BGN Curncy / MXN TIIE-F RFR curve",
+                f"{cfg.policy_anchor_ticker}, {cfg.policy_rate:.2f}%",
+                str(cfg.valuation_date.date()),
+                f"{cfg.forward_window_days} days after each meeting",
+                f"ACT/{cfg.day_count_basis}",
+                cfg.interpolation_method,
+                f"{cfg.standard_move_bps:.0f} bp",
+                f"{cfg.basis_bps:.1f} bp curve-to-policy adjustment",
+                scenario_preset.value,
+                "Discount-factor based scenario fair rate; no simple averages"
+            ]
+        })
+        display(assumptions)
+
+    with tables_box:
+        clear_output()
+        print("Live curve inputs")
+        display(curve_data.round(6))
+
+        print("Market-implied meeting path")
+        display(mp[[
+            "meeting_date", "curve_28d_forward", "implied_policy_rate",
+            "implied_rate_delta_bps", "number_of_25bp_moves", "direction"
+        ]].round(4))
+
+        print("User scenario path")
+        display(sp[[
+            "meeting_date", "implied_policy_rate", "scenario_move_bps",
+            "scenario_policy_rate", "market_minus_scenario_bps"
+        ]].round(4))
+
+        print("Fair value / position risk")
+        display(fv_local.round(4))
+
+    with summary_box:
+        clear_output()
+        print("Research summary")
+        display(make_research_summary(mp, sp, fv_local))
+        print("Sales summary")
+        display(make_sales_summary(mp, sp, fv_local))
+        print("Trading summary")
+        display(make_trading_summary(fv_local, position_dropdown.value).round(2))
+
+    with charts_box:
+        clear_output()
+        plot_all(mp, sp, fv_local)
+
+
+def on_run(_):
+    render_all(refresh_curve=False)
+
+def on_refresh(_):
+    render_all(refresh_curve=True)
+
+def on_preset_change(change):
+    if change["name"] == "value":
+        render_all(refresh_curve=False)
+
+run_button.on_click(on_run)
+refresh_button.on_click(on_refresh)
+scenario_preset.observe(on_preset_change, names="value")
+
+controls = widgets.VBox([
+    widgets.HTML("<h3>Assumptions</h3>"),
+    widgets.HBox([policy_input, basis_input, move_size_input]),
+    widgets.HBox([scenario_preset, position_dropdown, dv01_input]),
+    widgets.HBox([run_button, refresh_button]),
+    widgets.HTML("<h3>Scenario Moves by Meeting, in bps</h3>"),
+    widgets.HTML("<b>+25 = hike, -25 = cut, 0 = hold. Switch Scenario to Custom before manually editing.</b>"),
+    widgets.VBox(move_inputs),
+])
+
+tabs = widgets.Tab(children=[assumptions_box, tables_box, charts_box, summary_box])
+tabs.set_title(0, "Assumptions")
+tabs.set_title(1, "Tables")
+tabs.set_title(2, "Charts")
+tabs.set_title(3, "Desk Summaries")
+
+display(controls)
+display(tabs)
+
+render_all(refresh_curve=False)
+
+
