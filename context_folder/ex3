@@ -1,0 +1,3748 @@
+
+# ============================================================
+# TURKEY OIS POLICY PRICER — V2
+# Short-end, meeting-step, trader-focused rebuild
+# ============================================================
+#
+#
+# What the model does
+# -------------------
+# 1. Uses only 1W–1Y TRY OIS quotes.
+# 2. Converts each short OIS quote into a discount factor.
+# 3. Interpolates LOG DISCOUNT FACTORS smoothly between quoted maturities.
+# 4. Fits a PIECEWISE-CONSTANT overnight-rate path whose jumps occur only on
+#    scheduled CBRT meeting dates.
+# 5. Maps the overnight path to a policy-equivalent path using an explicit
+#    overnight-policy basis.
+# 6. Lets the user edit meeting moves and reprices one selected OIS trade.
+#
+# The curve is smooth; the policy path is stepwise.
+# ============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+
+import plotly.graph_objects as go
+import ipywidgets as widgets
+from IPython.display import FileLink, HTML, Markdown, clear_output, display
+
+try:
+    import bql
+    BQ = bql.Service()
+    HAS_BQL = True
+except Exception:
+    bql = None
+    BQ = None
+    HAS_BQL = False
+
+
+# ============================================================
+# 1. MARKET SNAPSHOT
+# ============================================================
+
+AS_OF_DATE = pd.Timestamp("2026-07-09")
+
+POLICY_TICKER = "TUBR1WRA Index"
+DEFAULT_POLICY_RATE = 37.00
+DEFAULT_EFFECTIVE_OVERNIGHT = 40.00
+DEFAULT_OVERNIGHT_POLICY_BASIS_BPS = 300.0
+
+MEETING_DATES = pd.to_datetime([
+    "2026-07-23",
+    "2026-09-10",
+    "2026-10-22",
+    "2026-12-10",
+])
+
+SHORT_OIS_SNAPSHOT = [
+    ("1W", "TYSO1Z BGN Curncy", 40.10, 7),
+    ("2W", "TYSO2Z BGN Curncy", 39.79, 14),
+    ("1M", "TYSOA BGN Curncy", 39.37, 30),
+    ("2M", "TYSOB BGN Curncy", 39.53, 60),
+    ("3M", "TYSOC BGN Curncy", 39.74, 91),
+    ("6M", "TYSOF BGN Curncy", 38.94, 182),
+    ("9M", "TYSOI BGN Curncy", 38.27, 273),
+    ("1Y", "TYSO1 BGN Curncy", 37.73, 365),
+]
+
+TRADE_TENORS = {
+    "1M": 30,
+    "2M": 60,
+    "3M": 91,
+    "6M": 182,
+    "9M": 273,
+    "1Y": 365,
+}
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    day_count_basis: int = 360
+    standard_move_bps: float = 250.0
+    smoothness_lambda: float = 0.03
+    max_fit_error_warning_bps: float = 5.0
+
+
+# ============================================================
+# 2. DATA
+# ============================================================
+
+class TurkeyOISData:
+    @staticmethod
+    def snapshot() -> pd.DataFrame:
+        return pd.DataFrame(
+            SHORT_OIS_SNAPSHOT,
+            columns=["tenor", "ticker", "par_rate", "days"],
+        ).assign(source="Snapshot 2026-07-09")
+
+    @staticmethod
+    def live() -> pd.DataFrame:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        tickers = [row[1] for row in SHORT_OIS_SNAPSHOT]
+        ticker_to_tenor = {row[1]: row[0] for row in SHORT_OIS_SNAPSHOT}
+        tenor_to_days = {row[0]: row[3] for row in SHORT_OIS_SNAPSHOT}
+
+        request = bql.Request(tickers, {"par_rate": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in raw.columns else raw.columns[0]
+        value_col = "par_rate" if "par_rate" in raw.columns else raw.columns[-1]
+
+        df = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[value_col], errors="coerce"),
+        })
+        df["tenor"] = df["ticker"].map(ticker_to_tenor)
+        df["days"] = df["tenor"].map(tenor_to_days)
+        df["source"] = "Live BQL"
+        return (
+            df.dropna(subset=["tenor", "days", "par_rate"])
+              .sort_values("days")
+              .reset_index(drop=True)
+        )
+
+    @staticmethod
+    def live_policy_rate() -> float:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        request = bql.Request([POLICY_TICKER], {"policy": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+        value_col = "policy" if "policy" in raw.columns else raw.columns[-1]
+        value = pd.to_numeric(raw[value_col], errors="coerce").iloc[0]
+        if pd.isna(value):
+            raise RuntimeError("Policy ticker returned a non-numeric value.")
+        return float(value)
+
+
+# ============================================================
+# 3. SMOOTH MARKET DISCOUNT CURVE
+# ============================================================
+
+class ShortOISCurve:
+    """
+    All maturities are <= 1Y, so the fixed leg is treated as one bullet payment.
+
+    Par OIS condition:
+        S * alpha * DF(T) = 1 - DF(T)
+
+    Therefore:
+        DF(T) = 1 / (1 + S * alpha)
+
+    Interpolation is applied to LOG DISCOUNT FACTORS, not to policy rates.
+    """
+
+    @staticmethod
+    def build(quotes: pd.DataFrame, settings: ModelSettings):
+        curve = quotes.copy().sort_values("days").reset_index(drop=True)
+        curve["par_rate"] = pd.to_numeric(curve["par_rate"], errors="coerce")
+        curve = curve.dropna(subset=["par_rate", "days"])
+
+        alpha = curve["days"].to_numpy(float) / settings.day_count_basis
+        rates = curve["par_rate"].to_numpy(float) / 100.0
+        curve["discount_factor"] = 1.0 / (1.0 + rates * alpha)
+        curve["log_discount_factor"] = np.log(curve["discount_factor"])
+
+        node_days = np.r_[0.0, curve["days"].to_numpy(float)]
+        node_logdfs = np.r_[0.0, curve["log_discount_factor"].to_numpy(float)]
+
+        logdf_fn = PchipInterpolator(node_days, node_logdfs, extrapolate=True)
+        return curve, logdf_fn
+
+    @staticmethod
+    def df(logdf_fn, days: int) -> float:
+        if days <= 0:
+            return 1.0
+        return float(np.exp(logdf_fn(float(days))))
+
+    @staticmethod
+    def bullet_par_rate(logdf_fn, days: int, settings: ModelSettings) -> float:
+        df = ShortOISCurve.df(logdf_fn, days)
+        alpha = days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+
+# ============================================================
+# 4. STEP-FUNCTION MEETING PATH
+# ============================================================
+
+class MeetingStepPath:
+    @staticmethod
+    def boundary_days() -> np.ndarray:
+        days = [(date - AS_OF_DATE).days for date in MEETING_DATES]
+        return np.asarray([0] + days + [365], dtype=int)
+
+    @staticmethod
+    def df_from_steps(
+        target_day: int,
+        boundaries: np.ndarray,
+        overnight_rates_pct: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        """
+        Simple daily-interval compounding under a piecewise-constant rate.
+        The rate changes only at CBRT meeting boundaries.
+        """
+        accumulation = 1.0
+        for i, rate in enumerate(overnight_rates_pct):
+            start = int(boundaries[i])
+            end = int(boundaries[i + 1])
+            overlap = max(min(int(target_day), end) - start, 0)
+            if overlap > 0:
+                accumulation *= (
+                    1.0
+                    + (float(rate) / 100.0)
+                    * (overlap / settings.day_count_basis)
+                )
+            if target_day <= end:
+                break
+        return 1.0 / accumulation
+
+    @staticmethod
+    def calibrate(
+        smooth_logdf_fn,
+        effective_overnight_anchor: float,
+        policy_rate: float,
+        overnight_policy_basis_bps: float,
+        settings: ModelSettings,
+    ):
+        boundaries = MeetingStepPath.boundary_days()
+
+        # Use every available short-end maturity.
+        calibration_days = np.asarray(
+            [row[3] for row in SHORT_OIS_SNAPSHOT],
+            dtype=int,
+        )
+        target_dfs = np.asarray(
+            [ShortOISCurve.df(smooth_logdf_fn, day) for day in calibration_days],
+            dtype=float,
+        )
+
+        # Heavier weight at the very short end where meeting information is clearest.
+        weights = 1.0 / np.sqrt(np.maximum(calibration_days, 7) / 7.0)
+
+        # There are 5 segments:
+        # today→Jul, Jul→Sep, Sep→Oct, Oct→Dec, Dec→1Y.
+        # Segment 0 is anchored. The four post-meeting rates are solved.
+        initial = np.full(4, effective_overnight_anchor)
+
+        def residuals(post_meeting_rates: np.ndarray) -> np.ndarray:
+            rates = np.r_[effective_overnight_anchor, post_meeting_rates]
+
+            df_errors_bps = []
+            for day, target_df, weight in zip(calibration_days, target_dfs, weights):
+                model_df = MeetingStepPath.df_from_steps(
+                    day, boundaries, rates, settings
+                )
+                # Convert DF error into an approximately rate-like bp error.
+                alpha = day / settings.day_count_basis
+                target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+                model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+                df_errors_bps.append((model_rate - target_rate) * 100.0 * weight)
+
+            # Mild smoothing: prevents arbitrary alternating moves while still
+            # allowing large Turkey-sized cuts.
+            consecutive_moves_bps = np.diff(rates) * 100.0
+            smooth_penalty = (
+                np.sqrt(settings.smoothness_lambda)
+                * consecutive_moves_bps
+                / settings.standard_move_bps
+            )
+            return np.r_[df_errors_bps, smooth_penalty]
+
+        result = least_squares(
+            residuals,
+            initial,
+            bounds=(np.zeros(4), np.full(4, 100.0)),
+            xtol=1e-13,
+            ftol=1e-13,
+            gtol=1e-13,
+            max_nfev=10000,
+        )
+        if not result.success:
+            raise RuntimeError(f"Meeting calibration failed: {result.message}")
+
+        overnight_rates = np.r_[effective_overnight_anchor, result.x]
+        policy_equivalent_rates = (
+            overnight_rates - overnight_policy_basis_bps / 100.0
+        )
+
+        path_rows = []
+        previous_policy = policy_rate
+
+        for i, meeting_date in enumerate(MEETING_DATES, start=1):
+            post_policy = float(policy_equivalent_rates[i])
+            move_bps = (post_policy - previous_policy) * 100.0
+            move_units = move_bps / settings.standard_move_bps
+
+            path_rows.append({
+                "meeting_date": meeting_date,
+                "market_move_bps": move_bps,
+                "market_policy_rate": post_policy,
+                "market_overnight_rate": float(overnight_rates[i]),
+                "move_units": move_units,
+                "binary_probability_pct_if_applicable": (
+                    abs(move_units) * 100.0 if abs(move_units) <= 1.0 else np.nan
+                ),
+            })
+            previous_policy = post_policy
+
+        diagnostic_rows = []
+        for tenor, _, _, day in SHORT_OIS_SNAPSHOT:
+            target_df = ShortOISCurve.df(smooth_logdf_fn, day)
+            model_df = MeetingStepPath.df_from_steps(
+                day, boundaries, overnight_rates, settings
+            )
+            alpha = day / settings.day_count_basis
+            target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+            model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+
+            diagnostic_rows.append({
+                "tenor": tenor,
+                "days": day,
+                "market_rate": target_rate,
+                "step_model_rate": model_rate,
+                "fit_error_bps": (model_rate - target_rate) * 100.0,
+            })
+
+        return (
+            pd.DataFrame(path_rows),
+            pd.DataFrame(diagnostic_rows),
+            boundaries,
+            overnight_rates,
+        )
+
+
+# ============================================================
+# 5. USER SCENARIO + SELECTED TRADE
+# ============================================================
+
+class ScenarioAndTrade:
+    @staticmethod
+    def scenario_path(
+        market_path: pd.DataFrame,
+        policy_rate: float,
+        basis_bps: float,
+        user_moves_bps: Sequence[float],
+    ) -> pd.DataFrame:
+        if len(user_moves_bps) != len(market_path):
+            raise ValueError("Enter one scenario move per meeting.")
+
+        result = market_path.copy()
+        result["user_move_bps"] = [float(x) for x in user_moves_bps]
+
+        running_policy = policy_rate
+        user_policy_rates = []
+        for move in result["user_move_bps"]:
+            running_policy += move / 100.0
+            user_policy_rates.append(running_policy)
+
+        result["user_policy_rate"] = user_policy_rates
+        result["user_overnight_rate"] = (
+            result["user_policy_rate"] + basis_bps / 100.0
+        )
+        result["user_minus_market_bps"] = (
+            result["user_policy_rate"] - result["market_policy_rate"]
+        ) * 100.0
+        return result
+
+    @staticmethod
+    def scenario_segment_rates(
+        scenario_path: pd.DataFrame,
+        effective_overnight_anchor: float,
+    ) -> np.ndarray:
+        return np.asarray(
+            [effective_overnight_anchor]
+            + scenario_path["user_overnight_rate"].tolist(),
+            dtype=float,
+        )
+
+    @staticmethod
+    def bullet_par_rate_from_steps(
+        maturity_days: int,
+        boundaries: np.ndarray,
+        rates: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+    @staticmethod
+    def trade_metrics(
+        smooth_logdf_fn,
+        maturity_days: int,
+        boundaries: np.ndarray,
+        scenario_rates: np.ndarray,
+        notional: float,
+        direction: str,
+        settings: ModelSettings,
+    ) -> pd.DataFrame:
+        market_rate = ShortOISCurve.bullet_par_rate(
+            smooth_logdf_fn, maturity_days, settings
+        )
+        scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+
+        scenario_df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+
+        fixed_pv = (market_rate / 100.0) * alpha * scenario_df * notional
+        floating_pv = (1.0 - scenario_df) * notional
+        payer_pv = floating_pv - fixed_pv
+        position_pv = payer_pv if direction == "Pay fixed" else -payer_pv
+
+        dv01 = alpha * scenario_df * notional / 10000.0
+        gap_bps = (scenario_rate - market_rate) * 100.0
+
+        return pd.DataFrame([{
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": gap_bps,
+            "direction": direction,
+            "notional_try": notional,
+            "dv01_try_per_bp": dv01,
+            "scenario_pv_try": position_pv,
+            "trade_signal": (
+                "Pay fixed" if gap_bps > 1.0
+                else "Receive fixed" if gap_bps < -1.0
+                else "Near fair"
+            ),
+        }])
+
+
+# ============================================================
+# 6. CLEAN TRADER UI
+# ============================================================
+
+class TurkeyPolicyPricer:
+    def __init__(self):
+        self.settings = ModelSettings()
+
+        self.quotes = None
+        self.curve = None
+        self.logdf_fn = None
+        self.market_path = None
+        self.diagnostics = None
+        self.boundaries = None
+        self.market_overnight_rates = None
+        self.user_path = None
+        self.trade_result = None
+
+        self._build_widgets()
+
+    def _build_widgets(self):
+        # Headline inputs
+        self.data_source = widgets.ToggleButtons(
+            options=["Snapshot", "Live BQL"],
+            value="Snapshot",
+            description="Data:",
+        )
+        self.policy_rate = widgets.FloatText(
+            value=DEFAULT_POLICY_RATE,
+            description="Policy:",
+            layout=widgets.Layout(width="210px"),
+        )
+        self.overnight_anchor = widgets.FloatText(
+            value=DEFAULT_EFFECTIVE_OVERNIGHT,
+            description="Effective O/N:",
+            layout=widgets.Layout(width="235px"),
+        )
+
+        # Trade inputs
+        self.trade_tenor = widgets.Dropdown(
+            options=list(TRADE_TENORS),
+            value="6M",
+            description="OIS tenor:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.direction = widgets.Dropdown(
+            options=["Pay fixed", "Receive fixed"],
+            value="Pay fixed",
+            description="Direction:",
+            layout=widgets.Layout(width="230px"),
+        )
+        self.notional = widgets.FloatText(
+            value=100_000_000.0,
+            description="Notional TRY:",
+            layout=widgets.Layout(width="260px"),
+        )
+
+        self.refresh_button = widgets.Button(
+            description="Refresh market",
+            button_style="info",
+            icon="refresh",
+        )
+        self.reprice_button = widgets.Button(
+            description="Reprice scenario",
+            button_style="success",
+            icon="check",
+        )
+        self.export_button = widgets.Button(
+            description="Export",
+            icon="download",
+        )
+
+        # Scenario entry rows
+        self.move_inputs = []
+        for date in MEETING_DATES:
+            self.move_inputs.append(
+                widgets.FloatText(
+                    value=0.0,
+                    description=date.strftime("%d %b %Y"),
+                    layout=widgets.Layout(width="245px"),
+                )
+            )
+
+        # Technical assumptions hidden by default
+        self.basis = widgets.FloatText(
+            value=DEFAULT_OVERNIGHT_POLICY_BASIS_BPS,
+            description="O/N-policy basis bp:",
+            layout=widgets.Layout(width="300px"),
+        )
+        self.move_size = widgets.FloatText(
+            value=self.settings.standard_move_bps,
+            description="Standard move bp:",
+            layout=widgets.Layout(width="280px"),
+        )
+        self.smoothing = widgets.FloatText(
+            value=self.settings.smoothness_lambda,
+            description="Smooth λ:",
+            layout=widgets.Layout(width="250px"),
+        )
+
+        self.assumptions_box = widgets.VBox([
+            widgets.HTML(
+                "<b>Technical controls — model governance, not normal daily inputs</b>"
+            ),
+            widgets.HBox([self.basis, self.move_size, self.smoothing]),
+            widgets.HTML(
+                "Curve interpolation: shape-preserving interpolation of log discount factors. "
+                "Policy interpolation: none; the policy path is stepwise."
+            ),
+        ])
+        self.assumptions = widgets.Accordion(children=[self.assumptions_box])
+        self.assumptions.set_title(0, "Model assumptions and diagnostics")
+
+        # Outputs
+        self.summary_out = widgets.Output()
+        self.table_out = widgets.Output()
+        self.chart_out = widgets.Output()
+        self.diagnostics_out = widgets.Output()
+        self.export_out = widgets.Output()
+
+        self.refresh_button.on_click(lambda _: self.run(refresh=True))
+        self.reprice_button.on_click(lambda _: self.run(refresh=False))
+        self.export_button.on_click(lambda _: self.export_excel())
+
+    def current_settings(self) -> ModelSettings:
+        return ModelSettings(
+            day_count_basis=360,
+            standard_move_bps=float(self.move_size.value),
+            smoothness_lambda=max(float(self.smoothing.value), 0.0),
+            max_fit_error_warning_bps=5.0,
+        )
+
+    def load_market(self):
+        if self.data_source.value == "Live BQL":
+            self.quotes = TurkeyOISData.live()
+            self.policy_rate.value = TurkeyOISData.live_policy_rate()
+        else:
+            self.quotes = TurkeyOISData.snapshot()
+
+    def user_moves(self) -> List[float]:
+        return [float(widget.value) for widget in self.move_inputs]
+
+    def run(self, refresh: bool = False):
+        try:
+            settings = self.current_settings()
+
+            if refresh or self.quotes is None:
+                self.load_market()
+                self.curve, self.logdf_fn = ShortOISCurve.build(
+                    self.quotes, settings
+                )
+
+                (
+                    self.market_path,
+                    self.diagnostics,
+                    self.boundaries,
+                    self.market_overnight_rates,
+                ) = MeetingStepPath.calibrate(
+                    self.logdf_fn,
+                    float(self.overnight_anchor.value),
+                    float(self.policy_rate.value),
+                    float(self.basis.value),
+                    settings,
+                )
+
+            self.user_path = ScenarioAndTrade.scenario_path(
+                self.market_path,
+                float(self.policy_rate.value),
+                float(self.basis.value),
+                self.user_moves(),
+            )
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            self.trade_result = ScenarioAndTrade.trade_metrics(
+                self.logdf_fn,
+                TRADE_TENORS[self.trade_tenor.value],
+                self.boundaries,
+                scenario_rates,
+                float(self.notional.value),
+                self.direction.value,
+                settings,
+            )
+
+            self.render_summary(settings)
+            self.render_table()
+            self.render_chart()
+            self.render_diagnostics()
+
+        except Exception as exc:
+            with self.summary_out:
+                clear_output()
+                display(HTML(
+                    f"<h3 style='color:#b00020'>Error</h3><pre>{exc}</pre>"
+                ))
+
+    def render_summary(self, settings: ModelSettings):
+        with self.summary_out:
+            clear_output()
+
+            first = self.market_path.iloc[0]
+            trade = self.trade_result.iloc[0]
+            max_error = self.diagnostics["fit_error_bps"].abs().max()
+
+            display(HTML(
+                f"""
+                <div style="border:1px solid #777;padding:14px;border-radius:8px;">
+                  <h2 style="margin-top:0;">Turkey OIS Policy Pricer</h2>
+                  <b>As of:</b> {AS_OF_DATE.date()} &nbsp; | &nbsp;
+                  <b>Policy:</b> {self.policy_rate.value:.2f}% &nbsp; | &nbsp;
+                  <b>Effective O/N:</b> {self.overnight_anchor.value:.2f}%<br><br>
+
+                  <b>Next meeting ({first['meeting_date'].date()}):</b>
+                  {first['market_move_bps']:+.0f} bp implied,
+                  policy-equivalent rate {first['market_policy_rate']:.2f}%<br>
+
+                  <b>Selected trade:</b> {self.direction.value} {self.trade_tenor.value}
+                  on TRY {self.notional.value:,.0f}<br>
+                  <b>Market rate:</b> {trade['market_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Scenario fair:</b> {trade['scenario_fair_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Gap:</b> {trade['scenario_minus_market_bps']:+.1f} bp<br>
+                  <b>DV01:</b> TRY {trade['dv01_try_per_bp']:,.0f}/bp &nbsp; | &nbsp;
+                  <b>Scenario P&amp;L:</b> TRY {trade['scenario_pv_try']:,.0f}<br><br>
+
+                  <b>Calibration max error:</b> {max_error:.2f} bp
+                </div>
+                """
+            ))
+
+    def render_table(self):
+        with self.table_out:
+            clear_output()
+
+            table = self.market_path[[
+                "meeting_date",
+                "market_move_bps",
+                "market_policy_rate",
+            ]].copy()
+            table["user_move_bps"] = self.user_moves()
+            table["user_policy_rate"] = self.user_path["user_policy_rate"]
+            table["user_minus_market_bps"] = self.user_path[
+                "user_minus_market_bps"
+            ]
+
+            display(HTML("<h3>Market-implied path vs user scenario</h3>"))
+            display(table.round(2))
+
+    def render_chart(self):
+        with self.chart_out:
+            clear_output()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=self.market_path["meeting_date"],
+                y=self.market_path["market_policy_rate"],
+                mode="lines+markers",
+                line_shape="hv",
+                name="Market-implied policy",
+            ))
+            fig.add_trace(go.Scatter(
+                x=self.user_path["meeting_date"],
+                y=self.user_path["user_policy_rate"],
+                mode="lines+markers",
+                line_shape="hv",
+                name="User scenario",
+            ))
+            fig.update_layout(
+                title="CBRT market-implied path vs scenario",
+                xaxis_title="Meeting date",
+                yaxis_title="Policy-equivalent rate (%)",
+                height=430,
+                hovermode="x unified",
+            )
+            fig.show()
+
+    def render_diagnostics(self):
+        with self.diagnostics_out:
+            clear_output()
+            display(HTML("<h3>Short-end curve and calibration diagnostics</h3>"))
+            display(self.curve[[
+                "tenor",
+                "ticker",
+                "par_rate",
+                "discount_factor",
+                "source",
+            ]].round(8))
+            display(self.diagnostics.round(4))
+            display(HTML(
+                "<b>Interpretation:</b> interpolation is used only between market "
+                "discount-factor nodes. The policy path itself is not interpolated; "
+                "it remains constant between CBRT meetings."
+            ))
+
+    def export_excel(self):
+        with self.export_out:
+            clear_output()
+            if self.trade_result is None:
+                display(HTML("<b>Run the pricer first.</b>"))
+                return
+
+            path = Path.cwd() / "turkey_ois_policy_pricer_v2.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                self.quotes.to_excel(writer, sheet_name="market_quotes", index=False)
+                self.curve.to_excel(writer, sheet_name="discount_curve", index=False)
+                self.market_path.to_excel(writer, sheet_name="market_path", index=False)
+                self.user_path.to_excel(writer, sheet_name="user_scenario", index=False)
+                self.trade_result.to_excel(writer, sheet_name="selected_trade", index=False)
+                self.diagnostics.to_excel(writer, sheet_name="diagnostics", index=False)
+
+            display(FileLink(str(path)))
+
+    def display(self):
+        display(Markdown("""
+# Turkey OIS Policy Pricer — clean trader layout
+
+Use the meeting boxes to enter your CBRT scenario. The tool compares it with
+the market-implied path and reprices one selected short-dated OIS trade.
+"""))
+
+        header = widgets.VBox([
+            widgets.HBox([
+                self.data_source,
+                self.policy_rate,
+                self.overnight_anchor,
+                self.refresh_button,
+            ]),
+            self.summary_out,
+        ])
+
+        scenario_grid = widgets.GridBox(
+            children=self.move_inputs,
+            layout=widgets.Layout(
+                grid_template_columns="repeat(2, 260px)",
+                grid_gap="4px 20px",
+            ),
+        )
+
+        trade_controls = widgets.HBox([
+            self.trade_tenor,
+            self.direction,
+            self.notional,
+            self.reprice_button,
+            self.export_button,
+        ])
+
+        display(header)
+        display(HTML("<h3>1. Enter your CBRT meeting scenario, in basis points</h3>"))
+        display(scenario_grid)
+        display(HTML("<h3>2. Select the OIS trade to reprice</h3>"))
+        display(trade_controls)
+        display(self.table_out)
+        display(self.chart_out)
+        display(self.assumptions)
+        display(self.diagnostics_out)
+        display(self.export_out)
+
+        self.run(refresh=True)
+
+
+# Launch
+app = TurkeyPolicyPricer()
+app.display()
+
+
+
+# ============================================================
+# TURKEY OIS POLICY PRICER — V2
+# Short-end, meeting-step, trader-focused rebuild
+# ============================================================
+#
+# Run All in Bloomberg BQuant.
+#
+# What the model does
+# -------------------
+# 1. Uses only 1W–1Y TRY OIS quotes.
+# 2. Converts each short OIS quote into a discount factor.
+# 3. Interpolates LOG DISCOUNT FACTORS smoothly between quoted maturities.
+# 4. Fits a PIECEWISE-CONSTANT overnight-rate path whose jumps occur only on
+#    scheduled CBRT meeting dates.
+# 5. Maps the overnight path to a policy-equivalent path using an explicit
+#    overnight-policy basis.
+# 6. Lets the user edit meeting moves and reprices one selected OIS trade.
+#
+# The curve is smooth; the policy path is stepwise.
+# ============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import FileLink, HTML, Markdown, clear_output, display
+
+try:
+    import bql
+    BQ = bql.Service()
+    HAS_BQL = True
+except Exception:
+    bql = None
+    BQ = None
+    HAS_BQL = False
+
+
+# ============================================================
+# 1. MARKET SNAPSHOT
+# ============================================================
+
+AS_OF_DATE = pd.Timestamp("2026-07-09")
+
+POLICY_TICKER = "TUBR1WRA Index"
+DEFAULT_POLICY_RATE = 37.00
+DEFAULT_EFFECTIVE_OVERNIGHT = 40.00
+DEFAULT_OVERNIGHT_POLICY_BASIS_BPS = 300.0
+
+MEETING_DATES = pd.to_datetime([
+    "2026-07-23",
+    "2026-09-10",
+    "2026-10-22",
+    "2026-12-10",
+])
+
+SHORT_OIS_SNAPSHOT = [
+    ("1W", "TYSO1Z BGN Curncy", 40.10, 7),
+    ("2W", "TYSO2Z BGN Curncy", 39.79, 14),
+    ("1M", "TYSOA BGN Curncy", 39.37, 30),
+    ("2M", "TYSOB BGN Curncy", 39.53, 60),
+    ("3M", "TYSOC BGN Curncy", 39.74, 91),
+    ("6M", "TYSOF BGN Curncy", 38.94, 182),
+    ("9M", "TYSOI BGN Curncy", 38.27, 273),
+    ("1Y", "TYSO1 BGN Curncy", 37.73, 365),
+]
+
+TRADE_TENORS = {
+    "1M": 30,
+    "2M": 60,
+    "3M": 91,
+    "6M": 182,
+    "9M": 273,
+    "1Y": 365,
+}
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    day_count_basis: int = 360
+    standard_move_bps: float = 250.0
+    smoothness_lambda: float = 0.03
+    max_fit_error_warning_bps: float = 5.0
+
+
+# ============================================================
+# 2. DATA
+# ============================================================
+
+class TurkeyOISData:
+    @staticmethod
+    def snapshot() -> pd.DataFrame:
+        return pd.DataFrame(
+            SHORT_OIS_SNAPSHOT,
+            columns=["tenor", "ticker", "par_rate", "days"],
+        ).assign(source="Snapshot 2026-07-09")
+
+    @staticmethod
+    def live() -> pd.DataFrame:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        tickers = [row[1] for row in SHORT_OIS_SNAPSHOT]
+        ticker_to_tenor = {row[1]: row[0] for row in SHORT_OIS_SNAPSHOT}
+        tenor_to_days = {row[0]: row[3] for row in SHORT_OIS_SNAPSHOT}
+
+        request = bql.Request(tickers, {"par_rate": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in raw.columns else raw.columns[0]
+        value_col = "par_rate" if "par_rate" in raw.columns else raw.columns[-1]
+
+        df = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[value_col], errors="coerce"),
+        })
+        df["tenor"] = df["ticker"].map(ticker_to_tenor)
+        df["days"] = df["tenor"].map(tenor_to_days)
+        df["source"] = "Live BQL"
+        return (
+            df.dropna(subset=["tenor", "days", "par_rate"])
+              .sort_values("days")
+              .reset_index(drop=True)
+        )
+
+    @staticmethod
+    def live_policy_rate() -> float:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        request = bql.Request([POLICY_TICKER], {"policy": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+        value_col = "policy" if "policy" in raw.columns else raw.columns[-1]
+        value = pd.to_numeric(raw[value_col], errors="coerce").iloc[0]
+        if pd.isna(value):
+            raise RuntimeError("Policy ticker returned a non-numeric value.")
+        return float(value)
+
+
+# ============================================================
+# 3. SMOOTH MARKET DISCOUNT CURVE
+# ============================================================
+
+class ShortOISCurve:
+    """
+    All maturities are <= 1Y, so the fixed leg is treated as one bullet payment.
+
+    Par OIS condition:
+        S * alpha * DF(T) = 1 - DF(T)
+
+    Therefore:
+        DF(T) = 1 / (1 + S * alpha)
+
+    Interpolation is applied to LOG DISCOUNT FACTORS, not to policy rates.
+    """
+
+    @staticmethod
+    def build(quotes: pd.DataFrame, settings: ModelSettings):
+        curve = quotes.copy().sort_values("days").reset_index(drop=True)
+        curve["par_rate"] = pd.to_numeric(curve["par_rate"], errors="coerce")
+        curve = curve.dropna(subset=["par_rate", "days"])
+
+        alpha = curve["days"].to_numpy(float) / settings.day_count_basis
+        rates = curve["par_rate"].to_numpy(float) / 100.0
+        curve["discount_factor"] = 1.0 / (1.0 + rates * alpha)
+        curve["log_discount_factor"] = np.log(curve["discount_factor"])
+
+        node_days = np.r_[0.0, curve["days"].to_numpy(float)]
+        node_logdfs = np.r_[0.0, curve["log_discount_factor"].to_numpy(float)]
+
+        logdf_fn = PchipInterpolator(node_days, node_logdfs, extrapolate=True)
+        return curve, logdf_fn
+
+    @staticmethod
+    def df(logdf_fn, days: int) -> float:
+        if days <= 0:
+            return 1.0
+        return float(np.exp(logdf_fn(float(days))))
+
+    @staticmethod
+    def bullet_par_rate(logdf_fn, days: int, settings: ModelSettings) -> float:
+        df = ShortOISCurve.df(logdf_fn, days)
+        alpha = days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+
+# ============================================================
+# 4. STEP-FUNCTION MEETING PATH
+# ============================================================
+
+class MeetingStepPath:
+    @staticmethod
+    def boundary_days() -> np.ndarray:
+        days = [(date - AS_OF_DATE).days for date in MEETING_DATES]
+        return np.asarray([0] + days + [365], dtype=int)
+
+    @staticmethod
+    def df_from_steps(
+        target_day: int,
+        boundaries: np.ndarray,
+        overnight_rates_pct: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        """
+        Simple daily-interval compounding under a piecewise-constant rate.
+        The rate changes only at CBRT meeting boundaries.
+        """
+        accumulation = 1.0
+        for i, rate in enumerate(overnight_rates_pct):
+            start = int(boundaries[i])
+            end = int(boundaries[i + 1])
+            overlap = max(min(int(target_day), end) - start, 0)
+            if overlap > 0:
+                accumulation *= (
+                    1.0
+                    + (float(rate) / 100.0)
+                    * (overlap / settings.day_count_basis)
+                )
+            if target_day <= end:
+                break
+        return 1.0 / accumulation
+
+    @staticmethod
+    def calibrate(
+        smooth_logdf_fn,
+        effective_overnight_anchor: float,
+        policy_rate: float,
+        overnight_policy_basis_bps: float,
+        settings: ModelSettings,
+    ):
+        boundaries = MeetingStepPath.boundary_days()
+
+        # Use every available short-end maturity.
+        calibration_days = np.asarray(
+            [row[3] for row in SHORT_OIS_SNAPSHOT],
+            dtype=int,
+        )
+        target_dfs = np.asarray(
+            [ShortOISCurve.df(smooth_logdf_fn, day) for day in calibration_days],
+            dtype=float,
+        )
+
+        # Heavier weight at the very short end where meeting information is clearest.
+        weights = 1.0 / np.sqrt(np.maximum(calibration_days, 7) / 7.0)
+
+        # There are 5 segments:
+        # today→Jul, Jul→Sep, Sep→Oct, Oct→Dec, Dec→1Y.
+        # Segment 0 is anchored. The four post-meeting rates are solved.
+        initial = np.full(4, effective_overnight_anchor)
+
+        def residuals(post_meeting_rates: np.ndarray) -> np.ndarray:
+            rates = np.r_[effective_overnight_anchor, post_meeting_rates]
+
+            df_errors_bps = []
+            for day, target_df, weight in zip(calibration_days, target_dfs, weights):
+                model_df = MeetingStepPath.df_from_steps(
+                    day, boundaries, rates, settings
+                )
+                # Convert DF error into an approximately rate-like bp error.
+                alpha = day / settings.day_count_basis
+                target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+                model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+                df_errors_bps.append((model_rate - target_rate) * 100.0 * weight)
+
+            # Mild smoothing: prevents arbitrary alternating moves while still
+            # allowing large Turkey-sized cuts.
+            consecutive_moves_bps = np.diff(rates) * 100.0
+            smooth_penalty = (
+                np.sqrt(settings.smoothness_lambda)
+                * consecutive_moves_bps
+                / settings.standard_move_bps
+            )
+            return np.r_[df_errors_bps, smooth_penalty]
+
+        result = least_squares(
+            residuals,
+            initial,
+            bounds=(np.zeros(4), np.full(4, 100.0)),
+            xtol=1e-13,
+            ftol=1e-13,
+            gtol=1e-13,
+            max_nfev=10000,
+        )
+        if not result.success:
+            raise RuntimeError(f"Meeting calibration failed: {result.message}")
+
+        overnight_rates = np.r_[effective_overnight_anchor, result.x]
+        policy_equivalent_rates = (
+            overnight_rates - overnight_policy_basis_bps / 100.0
+        )
+
+        path_rows = []
+        previous_policy = policy_rate
+
+        for i, meeting_date in enumerate(MEETING_DATES, start=1):
+            post_policy = float(policy_equivalent_rates[i])
+            move_bps = (post_policy - previous_policy) * 100.0
+            move_units = move_bps / settings.standard_move_bps
+
+            path_rows.append({
+                "meeting_date": meeting_date,
+                "market_move_bps": move_bps,
+                "market_policy_rate": post_policy,
+                "market_overnight_rate": float(overnight_rates[i]),
+                "move_units": move_units,
+                "binary_probability_pct_if_applicable": (
+                    abs(move_units) * 100.0 if abs(move_units) <= 1.0 else np.nan
+                ),
+            })
+            previous_policy = post_policy
+
+        diagnostic_rows = []
+        for tenor, _, _, day in SHORT_OIS_SNAPSHOT:
+            target_df = ShortOISCurve.df(smooth_logdf_fn, day)
+            model_df = MeetingStepPath.df_from_steps(
+                day, boundaries, overnight_rates, settings
+            )
+            alpha = day / settings.day_count_basis
+            target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+            model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+
+            diagnostic_rows.append({
+                "tenor": tenor,
+                "days": day,
+                "market_rate": target_rate,
+                "step_model_rate": model_rate,
+                "fit_error_bps": (model_rate - target_rate) * 100.0,
+            })
+
+        return (
+            pd.DataFrame(path_rows),
+            pd.DataFrame(diagnostic_rows),
+            boundaries,
+            overnight_rates,
+        )
+
+
+# ============================================================
+# 5. USER SCENARIO + SELECTED TRADE
+# ============================================================
+
+class ScenarioAndTrade:
+    @staticmethod
+    def scenario_path(
+        market_path: pd.DataFrame,
+        policy_rate: float,
+        basis_bps: float,
+        user_moves_bps: Sequence[float],
+    ) -> pd.DataFrame:
+        if len(user_moves_bps) != len(market_path):
+            raise ValueError("Enter one scenario move per meeting.")
+
+        result = market_path.copy()
+        result["user_move_bps"] = [float(x) for x in user_moves_bps]
+
+        running_policy = policy_rate
+        user_policy_rates = []
+        for move in result["user_move_bps"]:
+            running_policy += move / 100.0
+            user_policy_rates.append(running_policy)
+
+        result["user_policy_rate"] = user_policy_rates
+        result["user_overnight_rate"] = (
+            result["user_policy_rate"] + basis_bps / 100.0
+        )
+        result["user_minus_market_bps"] = (
+            result["user_policy_rate"] - result["market_policy_rate"]
+        ) * 100.0
+        return result
+
+    @staticmethod
+    def scenario_segment_rates(
+        scenario_path: pd.DataFrame,
+        effective_overnight_anchor: float,
+    ) -> np.ndarray:
+        return np.asarray(
+            [effective_overnight_anchor]
+            + scenario_path["user_overnight_rate"].tolist(),
+            dtype=float,
+        )
+
+    @staticmethod
+    def bullet_par_rate_from_steps(
+        maturity_days: int,
+        boundaries: np.ndarray,
+        rates: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+    @staticmethod
+    def trade_metrics(
+        smooth_logdf_fn,
+        maturity_days: int,
+        boundaries: np.ndarray,
+        scenario_rates: np.ndarray,
+        notional: float,
+        direction: str,
+        settings: ModelSettings,
+    ) -> pd.DataFrame:
+        market_rate = ShortOISCurve.bullet_par_rate(
+            smooth_logdf_fn, maturity_days, settings
+        )
+        scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+
+        scenario_df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+
+        fixed_pv = (market_rate / 100.0) * alpha * scenario_df * notional
+        floating_pv = (1.0 - scenario_df) * notional
+        payer_pv = floating_pv - fixed_pv
+        position_pv = payer_pv if direction == "Pay fixed" else -payer_pv
+
+        dv01 = alpha * scenario_df * notional / 10000.0
+        gap_bps = (scenario_rate - market_rate) * 100.0
+
+        return pd.DataFrame([{
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": gap_bps,
+            "direction": direction,
+            "notional_try": notional,
+            "dv01_try_per_bp": dv01,
+            "scenario_pv_try": position_pv,
+            "trade_signal": (
+                "Pay fixed" if gap_bps > 1.0
+                else "Receive fixed" if gap_bps < -1.0
+                else "Near fair"
+            ),
+        }])
+
+
+# ============================================================
+# 6. CLEAN TRADER UI
+# ============================================================
+
+class TurkeyPolicyPricer:
+    def __init__(self):
+        self.settings = ModelSettings()
+
+        self.quotes = None
+        self.curve = None
+        self.logdf_fn = None
+        self.market_path = None
+        self.diagnostics = None
+        self.boundaries = None
+        self.market_overnight_rates = None
+        self.user_path = None
+        self.trade_result = None
+
+        self._build_widgets()
+
+    def _build_widgets(self):
+        # Headline inputs
+        self.data_source = widgets.ToggleButtons(
+            options=["Snapshot", "Live BQL"],
+            value="Snapshot",
+            description="Data:",
+        )
+        self.policy_rate = widgets.FloatText(
+            value=DEFAULT_POLICY_RATE,
+            description="Policy:",
+            layout=widgets.Layout(width="210px"),
+        )
+        self.overnight_anchor = widgets.FloatText(
+            value=DEFAULT_EFFECTIVE_OVERNIGHT,
+            description="Effective O/N:",
+            layout=widgets.Layout(width="235px"),
+        )
+
+        # Trade inputs
+        self.trade_tenor = widgets.Dropdown(
+            options=list(TRADE_TENORS),
+            value="6M",
+            description="OIS tenor:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.direction = widgets.Dropdown(
+            options=["Pay fixed", "Receive fixed"],
+            value="Pay fixed",
+            description="Direction:",
+            layout=widgets.Layout(width="230px"),
+        )
+        self.notional = widgets.FloatText(
+            value=100_000_000.0,
+            description="Notional TRY:",
+            layout=widgets.Layout(width="260px"),
+        )
+
+        self.refresh_button = widgets.Button(
+            description="Refresh market",
+            button_style="info",
+            icon="refresh",
+        )
+        self.reprice_button = widgets.Button(
+            description="Reprice scenario",
+            button_style="success",
+            icon="check",
+        )
+        self.export_button = widgets.Button(
+            description="Export",
+            icon="download",
+        )
+
+        # Scenario entry rows
+        self.move_inputs = []
+        for date in MEETING_DATES:
+            self.move_inputs.append(
+                widgets.FloatText(
+                    value=0.0,
+                    description=date.strftime("%d %b %Y"),
+                    layout=widgets.Layout(width="245px"),
+                )
+            )
+
+        # Technical assumptions hidden by default
+        self.basis = widgets.FloatText(
+            value=DEFAULT_OVERNIGHT_POLICY_BASIS_BPS,
+            description="O/N-policy basis bp:",
+            layout=widgets.Layout(width="300px"),
+        )
+        self.move_size = widgets.FloatText(
+            value=self.settings.standard_move_bps,
+            description="Standard move bp:",
+            layout=widgets.Layout(width="280px"),
+        )
+        self.smoothing = widgets.FloatText(
+            value=self.settings.smoothness_lambda,
+            description="Smooth λ:",
+            layout=widgets.Layout(width="250px"),
+        )
+
+        self.assumptions_box = widgets.VBox([
+            widgets.HTML(
+                "<b>Technical controls — model governance, not normal daily inputs</b>"
+            ),
+            widgets.HBox([self.basis, self.move_size, self.smoothing]),
+            widgets.HTML(
+                "Curve interpolation: shape-preserving interpolation of log discount factors. "
+                "Policy interpolation: none; the policy path is stepwise."
+            ),
+        ])
+        self.assumptions = widgets.Accordion(children=[self.assumptions_box])
+        self.assumptions.set_title(0, "Model assumptions and diagnostics")
+
+        # Outputs
+        self.summary_out = widgets.Output()
+        self.market_curve_out = widgets.Output()
+        self.table_out = widgets.Output()
+        self.chart_out = widgets.Output()
+        self.diagnostics_out = widgets.Output()
+        self.export_out = widgets.Output()
+
+        self.refresh_button.on_click(lambda _: self.run(refresh=True))
+        self.reprice_button.on_click(lambda _: self.run(refresh=False))
+        self.export_button.on_click(lambda _: self.export_excel())
+
+    def current_settings(self) -> ModelSettings:
+        return ModelSettings(
+            day_count_basis=360,
+            standard_move_bps=float(self.move_size.value),
+            smoothness_lambda=max(float(self.smoothing.value), 0.0),
+            max_fit_error_warning_bps=5.0,
+        )
+
+    def load_market(self):
+        if self.data_source.value == "Live BQL":
+            self.quotes = TurkeyOISData.live()
+            self.policy_rate.value = TurkeyOISData.live_policy_rate()
+        else:
+            self.quotes = TurkeyOISData.snapshot()
+
+    def user_moves(self) -> List[float]:
+        return [float(widget.value) for widget in self.move_inputs]
+
+    def run(self, refresh: bool = False):
+        try:
+            settings = self.current_settings()
+
+            if refresh or self.quotes is None:
+                self.load_market()
+                self.curve, self.logdf_fn = ShortOISCurve.build(
+                    self.quotes, settings
+                )
+
+                (
+                    self.market_path,
+                    self.diagnostics,
+                    self.boundaries,
+                    self.market_overnight_rates,
+                ) = MeetingStepPath.calibrate(
+                    self.logdf_fn,
+                    float(self.overnight_anchor.value),
+                    float(self.policy_rate.value),
+                    float(self.basis.value),
+                    settings,
+                )
+
+            self.user_path = ScenarioAndTrade.scenario_path(
+                self.market_path,
+                float(self.policy_rate.value),
+                float(self.basis.value),
+                self.user_moves(),
+            )
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            self.trade_result = ScenarioAndTrade.trade_metrics(
+                self.logdf_fn,
+                TRADE_TENORS[self.trade_tenor.value],
+                self.boundaries,
+                scenario_rates,
+                float(self.notional.value),
+                self.direction.value,
+                settings,
+            )
+
+            self.render_summary(settings)
+            self.render_market_curve()
+            self.render_table()
+            self.render_chart()
+            self.render_diagnostics()
+
+        except Exception as exc:
+            with self.summary_out:
+                clear_output()
+                display(HTML(
+                    f"<h3 style='color:#b00020'>Error</h3><pre>{exc}</pre>"
+                ))
+
+    def render_summary(self, settings: ModelSettings):
+        with self.summary_out:
+            clear_output()
+
+            first = self.market_path.iloc[0]
+            trade = self.trade_result.iloc[0]
+            max_error = self.diagnostics["fit_error_bps"].abs().max()
+
+            display(HTML(
+                f"""
+                <div style="border:1px solid #777;padding:14px;border-radius:8px;">
+                  <h2 style="margin-top:0;">Turkey OIS Policy Pricer</h2>
+                  <b>As of:</b> {AS_OF_DATE.date()} &nbsp; | &nbsp;
+                  <b>Policy:</b> {self.policy_rate.value:.2f}% &nbsp; | &nbsp;
+                  <b>Effective O/N:</b> {self.overnight_anchor.value:.2f}%<br><br>
+
+                  <b>Next meeting ({first['meeting_date'].date()}):</b>
+                  {first['market_move_bps']:+.0f} bp implied,
+                  policy-equivalent rate {first['market_policy_rate']:.2f}%<br>
+
+                  <b>Selected trade:</b> {self.direction.value} {self.trade_tenor.value}
+                  on TRY {self.notional.value:,.0f}<br>
+                  <b>Market rate:</b> {trade['market_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Scenario fair:</b> {trade['scenario_fair_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Gap:</b> {trade['scenario_minus_market_bps']:+.1f} bp<br>
+                  <b>DV01:</b> TRY {trade['dv01_try_per_bp']:,.0f}/bp &nbsp; | &nbsp;
+                  <b>Scenario P&amp;L:</b> TRY {trade['scenario_pv_try']:,.0f}<br><br>
+
+                  <b>Calibration max error:</b> {max_error:.2f} bp
+                </div>
+                """
+            ))
+
+    def render_table(self):
+        with self.table_out:
+            clear_output()
+
+            table = self.market_path[[
+                "meeting_date",
+                "market_move_bps",
+                "market_policy_rate",
+            ]].copy()
+            table["user_move_bps"] = self.user_moves()
+            table["user_policy_rate"] = self.user_path["user_policy_rate"]
+            table["user_minus_market_bps"] = self.user_path[
+                "user_minus_market_bps"
+            ]
+
+            table = table.rename(columns={
+                "meeting_date": "CBRT meeting",
+                "market_move_bps": "Market move (bp)",
+                "market_policy_rate": "Market policy (%)",
+                "user_move_bps": "User move (bp)",
+                "user_policy_rate": "User policy (%)",
+                "user_minus_market_bps": "User - market (bp)",
+            })
+
+            display(HTML("<h3>Market-implied path vs user scenario</h3>"))
+            display(table.round(2).reset_index(drop=True))
+
+    def render_market_curve(self):
+        """Display the actual smooth short-end OIS market curve."""
+        with self.market_curve_out:
+            clear_output()
+
+            settings = self.current_settings()
+            dense_days = np.arange(7, 366)
+            dense_rates = [
+                ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, int(day), settings
+                )
+                for day in dense_days
+            ]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=dense_days,
+                y=dense_rates,
+                mode="lines",
+                name="Interpolated OIS curve",
+                hovertemplate="Day %{x}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=self.curve["days"],
+                y=self.curve["par_rate"],
+                mode="markers+text",
+                text=self.curve["tenor"],
+                textposition="top center",
+                name="Market quotes",
+                marker={"size": 9},
+                hovertemplate="%{text}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.update_layout(
+                title="1. TRY short-end OIS market curve",
+                xaxis_title="Days to maturity",
+                yaxis_title="Par OIS rate (%)",
+                height=410,
+                hovermode="x unified",
+                margin={"l": 65, "r": 35, "t": 65, "b": 55},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>This is the actual market curve.</b> The dots are the quoted "
+                "1W–1Y OIS instruments. The smooth line comes from "
+                "shape-preserving interpolation of <i>log discount factors</i>."
+                "</div>"
+            ))
+
+    def render_chart(self):
+        with self.chart_out:
+            clear_output()
+
+            settings = self.current_settings()
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            repricing_rows = []
+            for tenor, days in TRADE_TENORS.items():
+                market_rate = ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, days, settings
+                )
+                scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+                    days,
+                    self.boundaries,
+                    scenario_rates,
+                    settings,
+                )
+                repricing_rows.append({
+                    "tenor": tenor,
+                    "market_rate": market_rate,
+                    "scenario_rate": scenario_rate,
+                    "difference_bps": (scenario_rate - market_rate) * 100.0,
+                })
+            repricing = pd.DataFrame(repricing_rows)
+
+            fig = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=(
+                    "2. Market-implied CBRT path vs user scenario",
+                    "3. OIS curve under the user scenario",
+                ),
+                horizontal_spacing=0.12,
+            )
+
+            market_dates = [AS_OF_DATE] + self.market_path["meeting_date"].tolist()
+            market_rates = [float(self.policy_rate.value)] + self.market_path[
+                "market_policy_rate"
+            ].tolist()
+            user_dates = [AS_OF_DATE] + self.user_path["meeting_date"].tolist()
+            user_rates = [float(self.policy_rate.value)] + self.user_path[
+                "user_policy_rate"
+            ].tolist()
+
+            fig.add_trace(go.Scatter(
+                x=market_dates,
+                y=market_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="Market-implied policy",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=user_dates,
+                y=user_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="User scenario",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["market_rate"],
+                mode="lines+markers",
+                name="Current market OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["scenario_rate"],
+                mode="lines+markers",
+                name="Scenario fair OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.update_yaxes(
+                title_text="Policy-equivalent rate (%)",
+                row=1,
+                col=1,
+            )
+            fig.update_xaxes(title_text="CBRT meeting date", row=1, col=1)
+            fig.update_yaxes(title_text="Par OIS rate (%)", row=1, col=2)
+            fig.update_xaxes(title_text="OIS tenor", row=1, col=2)
+
+            fig.update_layout(
+                title="Policy path and scenario transmission into the OIS curve",
+                height=500,
+                hovermode="x unified",
+                legend={"orientation": "h", "y": -0.18},
+                margin={"l": 65, "r": 35, "t": 85, "b": 100},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>Left:</b> policy is constant between meetings and jumps only "
+                "on a CBRT date. <b>Right:</b> the user scenario is translated "
+                "back into fair 1M–1Y OIS rates."
+                "</div>"
+            ))
+
+    def render_diagnostics(self):
+        with self.diagnostics_out:
+            clear_output()
+            display(HTML("<h3>Short-end curve and calibration diagnostics</h3>"))
+            display(self.curve[[
+                "tenor",
+                "ticker",
+                "par_rate",
+                "discount_factor",
+                "source",
+            ]].round(8))
+            display(self.diagnostics.round(4))
+            display(HTML(
+                "<b>Interpretation:</b> interpolation is used only between market "
+                "discount-factor nodes. The policy path itself is not interpolated; "
+                "it remains constant between CBRT meetings."
+            ))
+
+    def export_excel(self):
+        with self.export_out:
+            clear_output()
+            if self.trade_result is None:
+                display(HTML("<b>Run the pricer first.</b>"))
+                return
+
+            path = Path.cwd() / "turkey_ois_policy_pricer_v3.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                self.quotes.to_excel(writer, sheet_name="market_quotes", index=False)
+                self.curve.to_excel(writer, sheet_name="discount_curve", index=False)
+                self.market_path.to_excel(writer, sheet_name="market_path", index=False)
+                self.user_path.to_excel(writer, sheet_name="user_scenario", index=False)
+                self.trade_result.to_excel(writer, sheet_name="selected_trade", index=False)
+                self.diagnostics.to_excel(writer, sheet_name="diagnostics", index=False)
+
+            display(FileLink(str(path)))
+
+    def display(self):
+        display(Markdown("""
+# Turkey OIS Policy Pricer — curve + meeting-path layout
+
+Use the meeting boxes to enter your CBRT scenario. The tool compares it with
+the market-implied path and reprices one selected short-dated OIS trade.
+"""))
+
+        header = widgets.VBox([
+            widgets.HBox([
+                self.data_source,
+                self.policy_rate,
+                self.overnight_anchor,
+                self.refresh_button,
+            ]),
+            self.summary_out,
+        ])
+
+        scenario_grid = widgets.GridBox(
+            children=self.move_inputs,
+            layout=widgets.Layout(
+                grid_template_columns="repeat(2, 260px)",
+                grid_gap="4px 20px",
+            ),
+        )
+
+        trade_controls = widgets.HBox([
+            self.trade_tenor,
+            self.direction,
+            self.notional,
+            self.reprice_button,
+            self.export_button,
+        ])
+
+        display(header)
+        display(self.market_curve_out)
+        display(HTML("<h3>2. Enter your CBRT meeting scenario, in basis points</h3>"))
+        display(scenario_grid)
+        display(HTML("<h3>3. Select the OIS trade to reprice</h3>"))
+        display(trade_controls)
+        display(self.table_out)
+        display(self.chart_out)
+        display(self.assumptions)
+        display(self.diagnostics_out)
+        display(self.export_out)
+
+        self.run(refresh=True)
+
+
+# Launch
+app = TurkeyPolicyPricer()
+app.display()
+
+
+
+# ============================================================
+# TURKEY OIS POLICY PRICER — V2
+# Short-end, meeting-step, trader-focused rebuild
+# ============================================================
+#
+# Run All in Bloomberg BQuant.
+#
+# What the model does
+# -------------------
+# 1. Uses only 1W–1Y TRY OIS quotes.
+# 2. Converts each short OIS quote into a discount factor.
+# 3. Interpolates LOG DISCOUNT FACTORS smoothly between quoted maturities.
+# 4. Fits a PIECEWISE-CONSTANT overnight-rate path whose jumps occur only on
+#    scheduled CBRT meeting dates.
+# 5. Maps the overnight path to a policy-equivalent path using an explicit
+#    overnight-policy basis.
+# 6. Lets the user edit meeting moves and reprices one selected OIS trade.
+#
+# The curve is smooth; the policy path is stepwise.
+# ============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import FileLink, HTML, Markdown, clear_output, display
+
+try:
+    import bql
+    BQ = bql.Service()
+    HAS_BQL = True
+except Exception:
+    bql = None
+    BQ = None
+    HAS_BQL = False
+
+
+# ============================================================
+# 1. MARKET SNAPSHOT
+# ============================================================
+
+AS_OF_DATE = pd.Timestamp("2026-07-09")
+
+POLICY_TICKER = "TUBR1WRA Index"
+DEFAULT_POLICY_RATE = 37.00
+DEFAULT_EFFECTIVE_OVERNIGHT = 40.00
+DEFAULT_OVERNIGHT_POLICY_BASIS_BPS = 300.0
+
+MEETING_DATES = pd.to_datetime([
+    "2026-07-23",
+    "2026-09-10",
+    "2026-10-22",
+    "2026-12-10",
+])
+
+SHORT_OIS_SNAPSHOT = [
+    ("1W", "TYSO1Z BGN Curncy", 40.10, 7),
+    ("2W", "TYSO2Z BGN Curncy", 39.79, 14),
+    ("1M", "TYSOA BGN Curncy", 39.37, 30),
+    ("2M", "TYSOB BGN Curncy", 39.53, 60),
+    ("3M", "TYSOC BGN Curncy", 39.74, 91),
+    ("6M", "TYSOF BGN Curncy", 38.94, 182),
+    ("9M", "TYSOI BGN Curncy", 38.27, 273),
+    ("1Y", "TYSO1 BGN Curncy", 37.73, 365),
+]
+
+CALIBRATION_TENORS = ["1W", "2W", "1M", "2M", "3M", "6M"]
+VALIDATION_TENORS = ["9M", "1Y"]
+
+TRADE_TENORS = {
+    "1M": 30,
+    "2M": 60,
+    "3M": 91,
+    "6M": 182,
+    "9M*": 273,
+    "1Y*": 365,
+}
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    day_count_basis: int = 360
+    standard_move_bps: float = 250.0
+    smoothness_lambda: float = 0.015
+    max_fit_error_warning_bps: float = 5.0
+
+
+# ============================================================
+# 2. DATA
+# ============================================================
+
+class TurkeyOISData:
+    @staticmethod
+    def snapshot() -> pd.DataFrame:
+        return pd.DataFrame(
+            SHORT_OIS_SNAPSHOT,
+            columns=["tenor", "ticker", "par_rate", "days"],
+        ).assign(source="Snapshot 2026-07-09")
+
+    @staticmethod
+    def live() -> pd.DataFrame:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        tickers = [row[1] for row in SHORT_OIS_SNAPSHOT]
+        ticker_to_tenor = {row[1]: row[0] for row in SHORT_OIS_SNAPSHOT}
+        tenor_to_days = {row[0]: row[3] for row in SHORT_OIS_SNAPSHOT}
+
+        request = bql.Request(tickers, {"par_rate": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in raw.columns else raw.columns[0]
+        value_col = "par_rate" if "par_rate" in raw.columns else raw.columns[-1]
+
+        df = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[value_col], errors="coerce"),
+        })
+        df["tenor"] = df["ticker"].map(ticker_to_tenor)
+        df["days"] = df["tenor"].map(tenor_to_days)
+        df["source"] = "Live BQL"
+        return (
+            df.dropna(subset=["tenor", "days", "par_rate"])
+              .sort_values("days")
+              .reset_index(drop=True)
+        )
+
+    @staticmethod
+    def live_policy_rate() -> float:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        request = bql.Request([POLICY_TICKER], {"policy": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+        value_col = "policy" if "policy" in raw.columns else raw.columns[-1]
+        value = pd.to_numeric(raw[value_col], errors="coerce").iloc[0]
+        if pd.isna(value):
+            raise RuntimeError("Policy ticker returned a non-numeric value.")
+        return float(value)
+
+
+# ============================================================
+# 3. SMOOTH MARKET DISCOUNT CURVE
+# ============================================================
+
+class ShortOISCurve:
+    """
+    All maturities are <= 1Y, so the fixed leg is treated as one bullet payment.
+
+    Par OIS condition:
+        S * alpha * DF(T) = 1 - DF(T)
+
+    Therefore:
+        DF(T) = 1 / (1 + S * alpha)
+
+    Interpolation is applied to LOG DISCOUNT FACTORS, not to policy rates.
+    """
+
+    @staticmethod
+    def build(quotes: pd.DataFrame, settings: ModelSettings):
+        curve = quotes.copy().sort_values("days").reset_index(drop=True)
+        curve["par_rate"] = pd.to_numeric(curve["par_rate"], errors="coerce")
+        curve = curve.dropna(subset=["par_rate", "days"])
+
+        alpha = curve["days"].to_numpy(float) / settings.day_count_basis
+        rates = curve["par_rate"].to_numpy(float) / 100.0
+        curve["discount_factor"] = 1.0 / (1.0 + rates * alpha)
+        curve["log_discount_factor"] = np.log(curve["discount_factor"])
+
+        node_days = np.r_[0.0, curve["days"].to_numpy(float)]
+        node_logdfs = np.r_[0.0, curve["log_discount_factor"].to_numpy(float)]
+
+        logdf_fn = PchipInterpolator(node_days, node_logdfs, extrapolate=True)
+        return curve, logdf_fn
+
+    @staticmethod
+    def df(logdf_fn, days: int) -> float:
+        if days <= 0:
+            return 1.0
+        return float(np.exp(logdf_fn(float(days))))
+
+    @staticmethod
+    def bullet_par_rate(logdf_fn, days: int, settings: ModelSettings) -> float:
+        df = ShortOISCurve.df(logdf_fn, days)
+        alpha = days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+
+# ============================================================
+# 4. STEP-FUNCTION MEETING PATH
+# ============================================================
+
+class MeetingStepPath:
+    @staticmethod
+    def boundary_days() -> np.ndarray:
+        days = [(date - AS_OF_DATE).days for date in MEETING_DATES]
+        return np.asarray([0] + days + [365], dtype=int)
+
+    @staticmethod
+    def df_from_steps(
+        target_day: int,
+        boundaries: np.ndarray,
+        overnight_rates_pct: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        """
+        Simple daily-interval compounding under a piecewise-constant rate.
+        The rate changes only at CBRT meeting boundaries.
+        """
+        accumulation = 1.0
+        for i, rate in enumerate(overnight_rates_pct):
+            start = int(boundaries[i])
+            end = int(boundaries[i + 1])
+            overlap = max(min(int(target_day), end) - start, 0)
+            if overlap > 0:
+                accumulation *= (
+                    1.0
+                    + (float(rate) / 100.0)
+                    * (overlap / settings.day_count_basis)
+                )
+            if target_day <= end:
+                break
+        return 1.0 / accumulation
+
+    @staticmethod
+    def calibrate(
+        smooth_logdf_fn,
+        effective_overnight_anchor: float,
+        policy_rate: float,
+        overnight_policy_basis_bps: float,
+        settings: ModelSettings,
+    ):
+        """
+        Jointly calibrate all 2026 meeting moves.
+
+        Only 1W–6M instruments are used in the meeting solver because those
+        maturities are covered by the supplied 2026 CBRT calendar. 9M and 1Y
+        remain validation points: using them without the 2027 meeting calendar
+        would incorrectly force longer-horizon easing into the December meeting.
+        """
+        boundaries = MeetingStepPath.boundary_days()
+
+        calibration_rows = [
+            row for row in SHORT_OIS_SNAPSHOT
+            if row[0] in CALIBRATION_TENORS
+        ]
+        validation_rows = [
+            row for row in SHORT_OIS_SNAPSHOT
+            if row[0] in VALIDATION_TENORS
+        ]
+
+        calibration_days = np.asarray([row[3] for row in calibration_rows], dtype=int)
+        target_dfs = np.asarray(
+            [ShortOISCurve.df(smooth_logdf_fn, day) for day in calibration_days],
+            dtype=float,
+        )
+
+        # Strongest weight at the front end, where individual meetings are identified.
+        weights = 1.0 / np.sqrt(np.maximum(calibration_days, 7) / 7.0)
+
+        # Solve directly for the four policy moves, in basis points.
+        # Bounds permit Turkey-sized changes but prevent mathematically convenient
+        # multi-hundred-bp oscillations unsupported by the data.
+        initial_moves = np.array([-150.0, -100.0, -100.0, -100.0])
+
+        def rates_from_moves(move_bps: np.ndarray) -> np.ndarray:
+            policy_after = policy_rate + np.cumsum(move_bps) / 100.0
+            overnight_after = policy_after + overnight_policy_basis_bps / 100.0
+            return np.r_[effective_overnight_anchor, overnight_after]
+
+        def residuals(move_bps: np.ndarray) -> np.ndarray:
+            overnight_rates = rates_from_moves(move_bps)
+
+            pricing_errors = []
+            for day, target_df, weight in zip(calibration_days, target_dfs, weights):
+                model_df = MeetingStepPath.df_from_steps(
+                    day, boundaries, overnight_rates, settings
+                )
+                alpha = day / settings.day_count_basis
+                target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+                model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+                pricing_errors.append((model_rate - target_rate) * 100.0 * weight)
+
+            # Penalize changes in the size of consecutive meeting moves, not the
+            # absolute level of rates. This still allows a sustained cutting cycle.
+            second_difference = np.diff(move_bps)
+            smooth_penalty = (
+                np.sqrt(settings.smoothness_lambda)
+                * second_difference
+                / settings.standard_move_bps
+            )
+            return np.r_[pricing_errors, smooth_penalty]
+
+        result = least_squares(
+            residuals,
+            initial_moves,
+            bounds=(
+                np.full(4, -500.0),
+                np.full(4, 500.0),
+            ),
+            xtol=1e-13,
+            ftol=1e-13,
+            gtol=1e-13,
+            max_nfev=20000,
+        )
+        if not result.success:
+            raise RuntimeError(f"Meeting calibration failed: {result.message}")
+
+        calibrated_moves = result.x
+        overnight_rates = rates_from_moves(calibrated_moves)
+        policy_rates = policy_rate + np.cumsum(calibrated_moves) / 100.0
+
+        path_rows = []
+        previous_policy = policy_rate
+        for i, meeting_date in enumerate(MEETING_DATES):
+            post_policy = float(policy_rates[i])
+            move_bps = float(calibrated_moves[i])
+            move_units = move_bps / settings.standard_move_bps
+
+            path_rows.append({
+                "meeting_date": meeting_date,
+                "market_move_bps": move_bps,
+                "market_policy_rate": post_policy,
+                "market_overnight_rate": float(overnight_rates[i + 1]),
+                "move_units": move_units,
+                "binary_probability_pct_if_applicable": (
+                    abs(move_units) * 100.0 if abs(move_units) <= 1.0 else np.nan
+                ),
+            })
+            previous_policy = post_policy
+
+        diagnostic_rows = []
+        for tenor, _, _, day in calibration_rows + validation_rows:
+            target_df = ShortOISCurve.df(smooth_logdf_fn, day)
+            model_df = MeetingStepPath.df_from_steps(
+                day, boundaries, overnight_rates, settings
+            )
+            alpha = day / settings.day_count_basis
+            target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+            model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+
+            diagnostic_rows.append({
+                "tenor": tenor,
+                "use": "Calibration" if tenor in CALIBRATION_TENORS else "Validation only",
+                "days": day,
+                "market_rate": target_rate,
+                "step_model_rate": model_rate,
+                "fit_error_bps": (model_rate - target_rate) * 100.0,
+            })
+
+        return (
+            pd.DataFrame(path_rows),
+            pd.DataFrame(diagnostic_rows),
+            boundaries,
+            overnight_rates,
+        )
+
+
+# ============================================================
+# 5. USER SCENARIO + SELECTED TRADE
+# ============================================================
+
+class ScenarioAndTrade:
+    @staticmethod
+    def scenario_path(
+        market_path: pd.DataFrame,
+        policy_rate: float,
+        basis_bps: float,
+        user_moves_bps: Sequence[float],
+    ) -> pd.DataFrame:
+        if len(user_moves_bps) != len(market_path):
+            raise ValueError("Enter one scenario move per meeting.")
+
+        result = market_path.copy()
+        result["user_move_bps"] = [float(x) for x in user_moves_bps]
+
+        running_policy = policy_rate
+        user_policy_rates = []
+        for move in result["user_move_bps"]:
+            running_policy += move / 100.0
+            user_policy_rates.append(running_policy)
+
+        result["user_policy_rate"] = user_policy_rates
+        result["user_overnight_rate"] = (
+            result["user_policy_rate"] + basis_bps / 100.0
+        )
+        result["user_minus_market_bps"] = (
+            result["user_policy_rate"] - result["market_policy_rate"]
+        ) * 100.0
+        return result
+
+    @staticmethod
+    def scenario_segment_rates(
+        scenario_path: pd.DataFrame,
+        effective_overnight_anchor: float,
+    ) -> np.ndarray:
+        return np.asarray(
+            [effective_overnight_anchor]
+            + scenario_path["user_overnight_rate"].tolist(),
+            dtype=float,
+        )
+
+    @staticmethod
+    def bullet_par_rate_from_steps(
+        maturity_days: int,
+        boundaries: np.ndarray,
+        rates: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+    @staticmethod
+    def trade_metrics(
+        smooth_logdf_fn,
+        maturity_days: int,
+        boundaries: np.ndarray,
+        scenario_rates: np.ndarray,
+        notional: float,
+        direction: str,
+        settings: ModelSettings,
+    ) -> pd.DataFrame:
+        market_rate = ShortOISCurve.bullet_par_rate(
+            smooth_logdf_fn, maturity_days, settings
+        )
+        scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+
+        scenario_df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+
+        fixed_pv = (market_rate / 100.0) * alpha * scenario_df * notional
+        floating_pv = (1.0 - scenario_df) * notional
+        payer_pv = floating_pv - fixed_pv
+        position_pv = payer_pv if direction == "Pay fixed" else -payer_pv
+
+        dv01 = alpha * scenario_df * notional / 10000.0
+        gap_bps = (scenario_rate - market_rate) * 100.0
+
+        return pd.DataFrame([{
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": gap_bps,
+            "direction": direction,
+            "notional_try": notional,
+            "dv01_try_per_bp": dv01,
+            "scenario_pv_try": position_pv,
+            "trade_signal": (
+                "Pay fixed" if gap_bps > 1.0
+                else "Receive fixed" if gap_bps < -1.0
+                else "Near fair"
+            ),
+        }])
+
+
+# ============================================================
+# 6. CLEAN TRADER UI
+# ============================================================
+
+class TurkeyPolicyPricer:
+    def __init__(self):
+        self.settings = ModelSettings()
+
+        self.quotes = None
+        self.curve = None
+        self.logdf_fn = None
+        self.market_path = None
+        self.diagnostics = None
+        self.boundaries = None
+        self.market_overnight_rates = None
+        self.user_path = None
+        self.trade_result = None
+
+        self._build_widgets()
+
+    def _build_widgets(self):
+        # Headline inputs
+        self.data_source = widgets.ToggleButtons(
+            options=["Snapshot", "Live BQL"],
+            value="Snapshot",
+            description="Data:",
+        )
+        self.policy_rate = widgets.FloatText(
+            value=DEFAULT_POLICY_RATE,
+            description="Policy:",
+            layout=widgets.Layout(width="210px"),
+        )
+        self.overnight_anchor = widgets.FloatText(
+            value=DEFAULT_EFFECTIVE_OVERNIGHT,
+            description="Effective O/N:",
+            layout=widgets.Layout(width="235px"),
+        )
+
+        # Trade inputs
+        self.trade_tenor = widgets.Dropdown(
+            options=list(TRADE_TENORS),
+            value="6M",
+            description="OIS tenor:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.direction = widgets.Dropdown(
+            options=["Pay fixed", "Receive fixed"],
+            value="Pay fixed",
+            description="Direction:",
+            layout=widgets.Layout(width="230px"),
+        )
+        self.notional = widgets.FloatText(
+            value=100_000_000.0,
+            description="Notional TRY:",
+            layout=widgets.Layout(width="260px"),
+        )
+
+        self.refresh_button = widgets.Button(
+            description="Refresh market",
+            button_style="info",
+            icon="refresh",
+        )
+        self.reprice_button = widgets.Button(
+            description="Reprice scenario",
+            button_style="success",
+            icon="check",
+        )
+        self.export_button = widgets.Button(
+            description="Export",
+            icon="download",
+        )
+
+        # Scenario entry rows
+        self.move_inputs = []
+        for date in MEETING_DATES:
+            self.move_inputs.append(
+                widgets.FloatText(
+                    value=0.0,
+                    description=date.strftime("%d %b %Y"),
+                    layout=widgets.Layout(width="245px"),
+                )
+            )
+
+        # Technical assumptions hidden by default
+        self.basis = widgets.FloatText(
+            value=DEFAULT_OVERNIGHT_POLICY_BASIS_BPS,
+            description="O/N-policy basis bp:",
+            layout=widgets.Layout(width="300px"),
+        )
+        self.move_size = widgets.FloatText(
+            value=self.settings.standard_move_bps,
+            description="Standard move bp:",
+            layout=widgets.Layout(width="280px"),
+        )
+        self.smoothing = widgets.FloatText(
+            value=self.settings.smoothness_lambda,
+            description="Smooth λ:",
+            layout=widgets.Layout(width="250px"),
+        )
+
+        self.assumptions_box = widgets.VBox([
+            widgets.HTML(
+                "<b>Technical controls — model governance, not normal daily inputs</b>"
+            ),
+            widgets.HBox([self.basis, self.move_size, self.smoothing]),
+            widgets.HTML(
+                "Curve interpolation: shape-preserving interpolation of log discount factors. "
+                "Policy interpolation: none; the policy path is stepwise."
+            ),
+        ])
+        self.assumptions = widgets.Accordion(children=[self.assumptions_box])
+        self.assumptions.set_title(0, "Model assumptions and diagnostics")
+
+        # Outputs
+        self.summary_out = widgets.Output()
+        self.market_curve_out = widgets.Output()
+        self.table_out = widgets.Output()
+        self.chart_out = widgets.Output()
+        self.diagnostics_out = widgets.Output()
+        self.export_out = widgets.Output()
+
+        self.refresh_button.on_click(lambda _: self.run(refresh=True))
+        self.reprice_button.on_click(lambda _: self.run(refresh=False))
+        self.export_button.on_click(lambda _: self.export_excel())
+
+    def current_settings(self) -> ModelSettings:
+        return ModelSettings(
+            day_count_basis=360,
+            standard_move_bps=float(self.move_size.value),
+            smoothness_lambda=max(float(self.smoothing.value), 0.0),
+            max_fit_error_warning_bps=5.0,
+        )
+
+    def load_market(self):
+        if self.data_source.value == "Live BQL":
+            self.quotes = TurkeyOISData.live()
+            self.policy_rate.value = TurkeyOISData.live_policy_rate()
+        else:
+            self.quotes = TurkeyOISData.snapshot()
+
+    def user_moves(self) -> List[float]:
+        return [float(widget.value) for widget in self.move_inputs]
+
+    def run(self, refresh: bool = False):
+        try:
+            settings = self.current_settings()
+
+            if refresh or self.quotes is None:
+                self.load_market()
+                self.curve, self.logdf_fn = ShortOISCurve.build(
+                    self.quotes, settings
+                )
+
+                (
+                    self.market_path,
+                    self.diagnostics,
+                    self.boundaries,
+                    self.market_overnight_rates,
+                ) = MeetingStepPath.calibrate(
+                    self.logdf_fn,
+                    float(self.overnight_anchor.value),
+                    float(self.policy_rate.value),
+                    float(self.basis.value),
+                    settings,
+                )
+
+            self.user_path = ScenarioAndTrade.scenario_path(
+                self.market_path,
+                float(self.policy_rate.value),
+                float(self.basis.value),
+                self.user_moves(),
+            )
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            self.trade_result = ScenarioAndTrade.trade_metrics(
+                self.logdf_fn,
+                TRADE_TENORS[self.trade_tenor.value],
+                self.boundaries,
+                scenario_rates,
+                float(self.notional.value),
+                self.direction.value,
+                settings,
+            )
+
+            self.render_summary(settings)
+            self.render_market_curve()
+            self.render_table()
+            self.render_chart()
+            self.render_diagnostics()
+
+        except Exception as exc:
+            with self.summary_out:
+                clear_output()
+                display(HTML(
+                    f"<h3 style='color:#b00020'>Error</h3><pre>{exc}</pre>"
+                ))
+
+    def render_summary(self, settings: ModelSettings):
+        with self.summary_out:
+            clear_output()
+
+            first = self.market_path.iloc[0]
+            trade = self.trade_result.iloc[0]
+            max_error = self.diagnostics.loc[self.diagnostics["use"] == "Calibration", "fit_error_bps"].abs().max()
+
+            display(HTML(
+                f"""
+                <div style="border:1px solid #777;padding:14px;border-radius:8px;">
+                  <h2 style="margin-top:0;">Turkey OIS Policy Pricer</h2>
+                  <b>As of:</b> {AS_OF_DATE.date()} &nbsp; | &nbsp;
+                  <b>Policy:</b> {self.policy_rate.value:.2f}% &nbsp; | &nbsp;
+                  <b>Effective O/N:</b> {self.overnight_anchor.value:.2f}%<br><br>
+
+                  <b>Next meeting ({first['meeting_date'].date()}):</b>
+                  {first['market_move_bps']:+.0f} bp implied,
+                  policy-equivalent rate {first['market_policy_rate']:.2f}%<br>
+
+                  <b>Selected trade:</b> {self.direction.value} {self.trade_tenor.value}
+                  on TRY {self.notional.value:,.0f}<br>
+                  <b>Market rate:</b> {trade['market_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Scenario fair:</b> {trade['scenario_fair_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Gap:</b> {trade['scenario_minus_market_bps']:+.1f} bp<br>
+                  <b>DV01:</b> TRY {trade['dv01_try_per_bp']:,.0f}/bp &nbsp; | &nbsp;
+                  <b>Scenario P&amp;L:</b> TRY {trade['scenario_pv_try']:,.0f}<br><br>
+
+                  <b>Calibration max error (1W–6M):</b> {max_error:.2f} bp<br>
+                  <span style="font-size:0.92em;">
+                    9M and 1Y are validation-only until the 2027 CBRT meeting calendar is loaded.
+                    Trades marked * use a flat post-December overnight-rate assumption.
+                  </span>
+                </div>
+                """
+            ))
+
+    def render_table(self):
+        with self.table_out:
+            clear_output()
+
+            table = self.market_path[[
+                "meeting_date",
+                "market_move_bps",
+                "market_policy_rate",
+            ]].copy()
+            table["user_move_bps"] = self.user_moves()
+            table["user_policy_rate"] = self.user_path["user_policy_rate"]
+            table["user_minus_market_bps"] = self.user_path[
+                "user_minus_market_bps"
+            ]
+
+            table = table.rename(columns={
+                "meeting_date": "CBRT meeting",
+                "market_move_bps": "Market move (bp)",
+                "market_policy_rate": "Market policy (%)",
+                "user_move_bps": "User move (bp)",
+                "user_policy_rate": "User policy (%)",
+                "user_minus_market_bps": "User - market (bp)",
+            })
+
+            display(HTML("<h3>Market-implied path vs user scenario</h3>"))
+            display(table.round(2).reset_index(drop=True))
+
+    def render_market_curve(self):
+        """Display the actual smooth short-end OIS market curve."""
+        with self.market_curve_out:
+            clear_output()
+
+            settings = self.current_settings()
+            dense_days = np.arange(7, 366)
+            dense_rates = [
+                ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, int(day), settings
+                )
+                for day in dense_days
+            ]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=dense_days,
+                y=dense_rates,
+                mode="lines",
+                name="Interpolated OIS curve",
+                hovertemplate="Day %{x}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=self.curve["days"],
+                y=self.curve["par_rate"],
+                mode="markers+text",
+                text=self.curve["tenor"],
+                textposition="top center",
+                name="Market quotes",
+                marker={"size": 9},
+                hovertemplate="%{text}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.update_layout(
+                title="1. TRY short-end OIS market curve",
+                xaxis_title="Days to maturity",
+                yaxis_title="Par OIS rate (%)",
+                height=410,
+                hovermode="x unified",
+                margin={"l": 65, "r": 35, "t": 65, "b": 55},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>This is the actual market curve.</b> The dots are the quoted "
+                "1W–1Y OIS instruments. The smooth line comes from "
+                "shape-preserving interpolation of <i>log discount factors</i>."
+                "</div>"
+            ))
+
+    def render_chart(self):
+        with self.chart_out:
+            clear_output()
+
+            settings = self.current_settings()
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            repricing_rows = []
+            for tenor, days in TRADE_TENORS.items():
+                market_rate = ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, days, settings
+                )
+                scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+                    days,
+                    self.boundaries,
+                    scenario_rates,
+                    settings,
+                )
+                repricing_rows.append({
+                    "tenor": tenor,
+                    "market_rate": market_rate,
+                    "scenario_rate": scenario_rate,
+                    "difference_bps": (scenario_rate - market_rate) * 100.0,
+                })
+            repricing = pd.DataFrame(repricing_rows)
+
+            fig = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=(
+                    "2. Market-implied CBRT path vs user scenario",
+                    "3. OIS curve under the user scenario",
+                ),
+                horizontal_spacing=0.12,
+            )
+
+            market_dates = [AS_OF_DATE] + self.market_path["meeting_date"].tolist()
+            market_rates = [float(self.policy_rate.value)] + self.market_path[
+                "market_policy_rate"
+            ].tolist()
+            user_dates = [AS_OF_DATE] + self.user_path["meeting_date"].tolist()
+            user_rates = [float(self.policy_rate.value)] + self.user_path[
+                "user_policy_rate"
+            ].tolist()
+
+            fig.add_trace(go.Scatter(
+                x=market_dates,
+                y=market_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="Market-implied policy",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=user_dates,
+                y=user_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="User scenario",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["market_rate"],
+                mode="lines+markers",
+                name="Current market OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["scenario_rate"],
+                mode="lines+markers",
+                name="Scenario fair OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.update_yaxes(
+                title_text="Policy-equivalent rate (%)",
+                row=1,
+                col=1,
+            )
+            fig.update_xaxes(title_text="CBRT meeting date", row=1, col=1)
+            fig.update_yaxes(title_text="Par OIS rate (%)", row=1, col=2)
+            fig.update_xaxes(title_text="OIS tenor", row=1, col=2)
+
+            fig.update_layout(
+                title="Policy path and scenario transmission into the OIS curve",
+                height=500,
+                hovermode="x unified",
+                legend={"orientation": "h", "y": -0.18},
+                margin={"l": 65, "r": 35, "t": 85, "b": 100},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>Left:</b> policy is constant between meetings and jumps only "
+                "on a CBRT date. <b>Right:</b> the user scenario is translated "
+                "back into fair 1M–1Y OIS rates."
+                "</div>"
+            ))
+
+    def render_diagnostics(self):
+        with self.diagnostics_out:
+            clear_output()
+            display(HTML("<h3>Short-end curve and calibration diagnostics</h3>"))
+            display(self.curve[[
+                "tenor",
+                "ticker",
+                "par_rate",
+                "discount_factor",
+                "source",
+            ]].round(8))
+            display(self.diagnostics.round(4))
+            display(HTML(
+                "<b>Interpretation:</b> interpolation is used only between market "
+                "discount-factor nodes. The policy path itself is not interpolated; "
+                "it remains constant between CBRT meetings. The solver uses 1W–6M "
+                "quotes jointly. 9M and 1Y are shown only as validation until the "
+                "2027 CBRT calendar is added."
+            ))
+
+    def export_excel(self):
+        with self.export_out:
+            clear_output()
+            if self.trade_result is None:
+                display(HTML("<b>Run the pricer first.</b>"))
+                return
+
+            path = Path.cwd() / "turkey_ois_policy_pricer_v4.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                self.quotes.to_excel(writer, sheet_name="market_quotes", index=False)
+                self.curve.to_excel(writer, sheet_name="discount_curve", index=False)
+                self.market_path.to_excel(writer, sheet_name="market_path", index=False)
+                self.user_path.to_excel(writer, sheet_name="user_scenario", index=False)
+                self.trade_result.to_excel(writer, sheet_name="selected_trade", index=False)
+                self.diagnostics.to_excel(writer, sheet_name="diagnostics", index=False)
+
+            display(FileLink(str(path)))
+
+    def display(self):
+        display(Markdown("""
+# Turkey OIS Policy Pricer — constrained meeting calibration
+
+Use the meeting boxes to enter your CBRT scenario. The tool compares it with
+the market-implied path and reprices one selected short-dated OIS trade.
+"""))
+
+        header = widgets.VBox([
+            widgets.HBox([
+                self.data_source,
+                self.policy_rate,
+                self.overnight_anchor,
+                self.refresh_button,
+            ]),
+            self.summary_out,
+        ])
+
+        scenario_grid = widgets.GridBox(
+            children=self.move_inputs,
+            layout=widgets.Layout(
+                grid_template_columns="repeat(2, 260px)",
+                grid_gap="4px 20px",
+            ),
+        )
+
+        trade_controls = widgets.HBox([
+            self.trade_tenor,
+            self.direction,
+            self.notional,
+            self.reprice_button,
+            self.export_button,
+        ])
+
+        display(header)
+        display(self.market_curve_out)
+        display(HTML("<h3>2. Enter your CBRT meeting scenario, in basis points</h3>"))
+        display(scenario_grid)
+        display(HTML("<h3>3. Select the OIS trade to reprice</h3>"))
+        display(trade_controls)
+        display(self.table_out)
+        display(self.chart_out)
+        display(self.assumptions)
+        display(self.diagnostics_out)
+        display(self.export_out)
+
+        self.run(refresh=True)
+
+
+# Launch
+app = TurkeyPolicyPricer()
+app.display()
+
+
+
+
+
+# ============================================================
+# TURKEY OIS POLICY PRICER — V2
+# Short-end, meeting-step, trader-focused rebuild
+# ============================================================
+#
+# Run All in Bloomberg BQuant.
+#
+# What the model does
+# -------------------
+# 1. Uses only 1W–1Y TRY OIS quotes.
+# 2. Converts each short OIS quote into a discount factor.
+# 3. Interpolates LOG DISCOUNT FACTORS smoothly between quoted maturities.
+# 4. Fits a PIECEWISE-CONSTANT overnight-rate path whose jumps occur only on
+#    scheduled CBRT meeting dates.
+# 5. Maps the overnight path to a policy-equivalent path using an explicit
+#    overnight-policy basis.
+# 6. Lets the user edit meeting moves and reprices one selected OIS trade.
+#
+# The curve is smooth; the policy path is stepwise.
+# ============================================================
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import FileLink, HTML, Markdown, clear_output, display
+
+try:
+    import bql
+    BQ = bql.Service()
+    HAS_BQL = True
+except Exception:
+    bql = None
+    BQ = None
+    HAS_BQL = False
+
+
+# ============================================================
+# 1. MARKET SNAPSHOT
+# ============================================================
+
+AS_OF_DATE = pd.Timestamp("2026-07-09")
+
+POLICY_TICKER = "TUBR1WRA Index"
+DEFAULT_POLICY_RATE = 37.00
+DEFAULT_EFFECTIVE_OVERNIGHT = 40.00
+DEFAULT_OVERNIGHT_POLICY_BASIS_BPS = 300.0
+
+MEETING_DATES = pd.to_datetime([
+    "2026-07-23",
+    "2026-09-10",
+    "2026-10-22",
+    "2026-12-10",
+])
+
+SHORT_OIS_SNAPSHOT = [
+    ("1W", "TYSO1Z BGN Curncy", 40.10, 7),
+    ("2W", "TYSO2Z BGN Curncy", 39.79, 14),
+    ("1M", "TYSOA BGN Curncy", 39.37, 30),
+    ("2M", "TYSOB BGN Curncy", 39.53, 60),
+    ("3M", "TYSOC BGN Curncy", 39.74, 91),
+    ("6M", "TYSOF BGN Curncy", 38.94, 182),
+    ("9M", "TYSOI BGN Curncy", 38.27, 273),
+    ("1Y", "TYSO1 BGN Curncy", 37.73, 365),
+]
+
+CALIBRATION_TENORS = ["1W", "2W", "1M", "2M", "3M", "6M"]
+VALIDATION_TENORS = ["9M", "1Y"]
+
+TRADE_TENORS = {
+    "1M": 30,
+    "2M": 60,
+    "3M": 91,
+    "6M": 182,
+    "9M*": 273,
+    "1Y*": 365,
+}
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    day_count_basis: int = 360
+    standard_move_bps: float = 250.0
+    smoothness_lambda: float = 0.015
+    max_fit_error_warning_bps: float = 5.0
+
+
+# ============================================================
+# 2. DATA
+# ============================================================
+
+class TurkeyOISData:
+    @staticmethod
+    def snapshot() -> pd.DataFrame:
+        return pd.DataFrame(
+            SHORT_OIS_SNAPSHOT,
+            columns=["tenor", "ticker", "par_rate", "days"],
+        ).assign(source="Snapshot 2026-07-09")
+
+    @staticmethod
+    def live() -> pd.DataFrame:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        tickers = [row[1] for row in SHORT_OIS_SNAPSHOT]
+        ticker_to_tenor = {row[1]: row[0] for row in SHORT_OIS_SNAPSHOT}
+        tenor_to_days = {row[0]: row[3] for row in SHORT_OIS_SNAPSHOT}
+
+        request = bql.Request(tickers, {"par_rate": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in raw.columns else raw.columns[0]
+        value_col = "par_rate" if "par_rate" in raw.columns else raw.columns[-1]
+
+        df = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[value_col], errors="coerce"),
+        })
+        df["tenor"] = df["ticker"].map(ticker_to_tenor)
+        df["days"] = df["tenor"].map(tenor_to_days)
+        df["source"] = "Live BQL"
+        return (
+            df.dropna(subset=["tenor", "days", "par_rate"])
+              .sort_values("days")
+              .reset_index(drop=True)
+        )
+
+    @staticmethod
+    def live_policy_rate() -> float:
+        if not HAS_BQL:
+            raise RuntimeError("BQL is unavailable.")
+
+        request = bql.Request([POLICY_TICKER], {"policy": BQ.data.px_last()})
+        raw = BQ.execute(request)[0].df().reset_index()
+        value_col = "policy" if "policy" in raw.columns else raw.columns[-1]
+        value = pd.to_numeric(raw[value_col], errors="coerce").iloc[0]
+        if pd.isna(value):
+            raise RuntimeError("Policy ticker returned a non-numeric value.")
+        return float(value)
+
+
+# ============================================================
+# 3. SMOOTH MARKET DISCOUNT CURVE
+# ============================================================
+
+class ShortOISCurve:
+    """
+    All maturities are <= 1Y, so the fixed leg is treated as one bullet payment.
+
+    Par OIS condition:
+        S * alpha * DF(T) = 1 - DF(T)
+
+    Therefore:
+        DF(T) = 1 / (1 + S * alpha)
+
+    Interpolation is applied to LOG DISCOUNT FACTORS, not to policy rates.
+    """
+
+    @staticmethod
+    def build(quotes: pd.DataFrame, settings: ModelSettings):
+        curve = quotes.copy().sort_values("days").reset_index(drop=True)
+        curve["par_rate"] = pd.to_numeric(curve["par_rate"], errors="coerce")
+        curve = curve.dropna(subset=["par_rate", "days"])
+
+        alpha = curve["days"].to_numpy(float) / settings.day_count_basis
+        rates = curve["par_rate"].to_numpy(float) / 100.0
+        curve["discount_factor"] = 1.0 / (1.0 + rates * alpha)
+        curve["log_discount_factor"] = np.log(curve["discount_factor"])
+
+        node_days = np.r_[0.0, curve["days"].to_numpy(float)]
+        node_logdfs = np.r_[0.0, curve["log_discount_factor"].to_numpy(float)]
+
+        logdf_fn = PchipInterpolator(node_days, node_logdfs, extrapolate=True)
+        return curve, logdf_fn
+
+    @staticmethod
+    def df(logdf_fn, days: int) -> float:
+        if days <= 0:
+            return 1.0
+        return float(np.exp(logdf_fn(float(days))))
+
+    @staticmethod
+    def bullet_par_rate(logdf_fn, days: int, settings: ModelSettings) -> float:
+        df = ShortOISCurve.df(logdf_fn, days)
+        alpha = days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+
+# ============================================================
+# 4. STEP-FUNCTION MEETING PATH
+# ============================================================
+
+class MeetingStepPath:
+    @staticmethod
+    def boundary_days() -> np.ndarray:
+        days = [(date - AS_OF_DATE).days for date in MEETING_DATES]
+        return np.asarray([0] + days + [365], dtype=int)
+
+    @staticmethod
+    def df_from_steps(
+        target_day: int,
+        boundaries: np.ndarray,
+        overnight_rates_pct: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        """
+        Simple daily-interval compounding under a piecewise-constant rate.
+        The rate changes only at CBRT meeting boundaries.
+        """
+        accumulation = 1.0
+        for i, rate in enumerate(overnight_rates_pct):
+            start = int(boundaries[i])
+            end = int(boundaries[i + 1])
+            overlap = max(min(int(target_day), end) - start, 0)
+            if overlap > 0:
+                accumulation *= (
+                    1.0
+                    + (float(rate) / 100.0)
+                    * (overlap / settings.day_count_basis)
+                )
+            if target_day <= end:
+                break
+        return 1.0 / accumulation
+
+    @staticmethod
+    def calibrate(
+        smooth_logdf_fn,
+        effective_overnight_anchor: float,
+        policy_rate: float,
+        overnight_policy_basis_bps: float,
+        settings: ModelSettings,
+    ):
+        """
+        Jointly calibrate all 2026 meeting moves.
+
+        Only 1W–6M instruments are used in the meeting solver because those
+        maturities are covered by the supplied 2026 CBRT calendar. 9M and 1Y
+        remain validation points: using them without the 2027 meeting calendar
+        would incorrectly force longer-horizon easing into the December meeting.
+        """
+        boundaries = MeetingStepPath.boundary_days()
+
+        calibration_rows = [
+            row for row in SHORT_OIS_SNAPSHOT
+            if row[0] in CALIBRATION_TENORS
+        ]
+        validation_rows = [
+            row for row in SHORT_OIS_SNAPSHOT
+            if row[0] in VALIDATION_TENORS
+        ]
+
+        calibration_days = np.asarray([row[3] for row in calibration_rows], dtype=int)
+        target_dfs = np.asarray(
+            [ShortOISCurve.df(smooth_logdf_fn, day) for day in calibration_days],
+            dtype=float,
+        )
+
+        # Strongest weight at the front end, where individual meetings are identified.
+        weights = 1.0 / np.sqrt(np.maximum(calibration_days, 7) / 7.0)
+
+        # Solve directly for the four policy moves, in basis points.
+        # Bounds permit Turkey-sized changes but prevent mathematically convenient
+        # multi-hundred-bp oscillations unsupported by the data.
+        initial_moves = np.array([-150.0, -100.0, -100.0, -100.0])
+
+        def rates_from_moves(move_bps: np.ndarray) -> np.ndarray:
+            policy_after = policy_rate + np.cumsum(move_bps) / 100.0
+            overnight_after = policy_after + overnight_policy_basis_bps / 100.0
+            return np.r_[effective_overnight_anchor, overnight_after]
+
+        def residuals(move_bps: np.ndarray) -> np.ndarray:
+            overnight_rates = rates_from_moves(move_bps)
+
+            pricing_errors = []
+            for day, target_df, weight in zip(calibration_days, target_dfs, weights):
+                model_df = MeetingStepPath.df_from_steps(
+                    day, boundaries, overnight_rates, settings
+                )
+                alpha = day / settings.day_count_basis
+                target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+                model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+                pricing_errors.append((model_rate - target_rate) * 100.0 * weight)
+
+            # Penalize changes in the size of consecutive meeting moves, not the
+            # absolute level of rates. This still allows a sustained cutting cycle.
+            second_difference = np.diff(move_bps)
+            smooth_penalty = (
+                np.sqrt(settings.smoothness_lambda)
+                * second_difference
+                / settings.standard_move_bps
+            )
+            return np.r_[pricing_errors, smooth_penalty]
+
+        result = least_squares(
+            residuals,
+            initial_moves,
+            bounds=(
+                np.full(4, -500.0),
+                np.full(4, 500.0),
+            ),
+            xtol=1e-13,
+            ftol=1e-13,
+            gtol=1e-13,
+            max_nfev=20000,
+        )
+        if not result.success:
+            raise RuntimeError(f"Meeting calibration failed: {result.message}")
+
+        calibrated_moves = result.x
+        overnight_rates = rates_from_moves(calibrated_moves)
+        policy_rates = policy_rate + np.cumsum(calibrated_moves) / 100.0
+
+        path_rows = []
+        previous_policy = policy_rate
+        for i, meeting_date in enumerate(MEETING_DATES):
+            post_policy = float(policy_rates[i])
+            move_bps = float(calibrated_moves[i])
+            move_units = move_bps / settings.standard_move_bps
+
+            path_rows.append({
+                "meeting_date": meeting_date,
+                "market_move_bps": move_bps,
+                "market_policy_rate": post_policy,
+                "market_overnight_rate": float(overnight_rates[i + 1]),
+                "move_units": move_units,
+                "binary_probability_pct_if_applicable": (
+                    abs(move_units) * 100.0 if abs(move_units) <= 1.0 else np.nan
+                ),
+            })
+            previous_policy = post_policy
+
+        diagnostic_rows = []
+        for tenor, _, _, day in calibration_rows + validation_rows:
+            target_df = ShortOISCurve.df(smooth_logdf_fn, day)
+            model_df = MeetingStepPath.df_from_steps(
+                day, boundaries, overnight_rates, settings
+            )
+            alpha = day / settings.day_count_basis
+            target_rate = ((1.0 / target_df - 1.0) / alpha) * 100.0
+            model_rate = ((1.0 / model_df - 1.0) / alpha) * 100.0
+
+            diagnostic_rows.append({
+                "tenor": tenor,
+                "use": "Calibration" if tenor in CALIBRATION_TENORS else "Validation only",
+                "days": day,
+                "market_rate": target_rate,
+                "step_model_rate": model_rate,
+                "fit_error_bps": (model_rate - target_rate) * 100.0,
+            })
+
+        return (
+            pd.DataFrame(path_rows),
+            pd.DataFrame(diagnostic_rows),
+            boundaries,
+            overnight_rates,
+        )
+
+
+# ============================================================
+# 5. USER SCENARIO + SELECTED TRADE
+# ============================================================
+
+class ScenarioAndTrade:
+    @staticmethod
+    def scenario_path(
+        market_path: pd.DataFrame,
+        policy_rate: float,
+        basis_bps: float,
+        user_moves_bps: Sequence[float],
+    ) -> pd.DataFrame:
+        if len(user_moves_bps) != len(market_path):
+            raise ValueError("Enter one scenario move per meeting.")
+
+        result = market_path.copy()
+        result["user_move_bps"] = [float(x) for x in user_moves_bps]
+
+        running_policy = policy_rate
+        user_policy_rates = []
+        for move in result["user_move_bps"]:
+            running_policy += move / 100.0
+            user_policy_rates.append(running_policy)
+
+        result["user_policy_rate"] = user_policy_rates
+        result["user_overnight_rate"] = (
+            result["user_policy_rate"] + basis_bps / 100.0
+        )
+        result["user_minus_market_bps"] = (
+            result["user_policy_rate"] - result["market_policy_rate"]
+        ) * 100.0
+        return result
+
+    @staticmethod
+    def scenario_segment_rates(
+        scenario_path: pd.DataFrame,
+        effective_overnight_anchor: float,
+    ) -> np.ndarray:
+        return np.asarray(
+            [effective_overnight_anchor]
+            + scenario_path["user_overnight_rate"].tolist(),
+            dtype=float,
+        )
+
+    @staticmethod
+    def bullet_par_rate_from_steps(
+        maturity_days: int,
+        boundaries: np.ndarray,
+        rates: np.ndarray,
+        settings: ModelSettings,
+    ) -> float:
+        df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+        return ((1.0 - df) / (alpha * df)) * 100.0
+
+    @staticmethod
+    def trade_metrics(
+        smooth_logdf_fn,
+        maturity_days: int,
+        boundaries: np.ndarray,
+        scenario_rates: np.ndarray,
+        notional: float,
+        direction: str,
+        settings: ModelSettings,
+    ) -> pd.DataFrame:
+        market_rate = ShortOISCurve.bullet_par_rate(
+            smooth_logdf_fn, maturity_days, settings
+        )
+        scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+
+        scenario_df = MeetingStepPath.df_from_steps(
+            maturity_days, boundaries, scenario_rates, settings
+        )
+        alpha = maturity_days / settings.day_count_basis
+
+        fixed_pv = (market_rate / 100.0) * alpha * scenario_df * notional
+        floating_pv = (1.0 - scenario_df) * notional
+        payer_pv = floating_pv - fixed_pv
+        position_pv = payer_pv if direction == "Pay fixed" else -payer_pv
+
+        dv01 = alpha * scenario_df * notional / 10000.0
+        gap_bps = (scenario_rate - market_rate) * 100.0
+
+        return pd.DataFrame([{
+            "market_rate": market_rate,
+            "scenario_fair_rate": scenario_rate,
+            "scenario_minus_market_bps": gap_bps,
+            "direction": direction,
+            "notional_try": notional,
+            "dv01_try_per_bp": dv01,
+            "scenario_pv_try": position_pv,
+            "trade_signal": (
+                "Pay fixed" if gap_bps > 1.0
+                else "Receive fixed" if gap_bps < -1.0
+                else "Near fair"
+            ),
+        }])
+
+
+# ============================================================
+# 6. CLEAN TRADER UI
+# ============================================================
+
+class TurkeyPolicyPricer:
+    def __init__(self):
+        self.settings = ModelSettings()
+
+        self.quotes = None
+        self.curve = None
+        self.logdf_fn = None
+        self.market_path = None
+        self.diagnostics = None
+        self.boundaries = None
+        self.market_overnight_rates = None
+        self.user_path = None
+        self.trade_result = None
+
+        self._build_widgets()
+
+    def _build_widgets(self):
+        # Headline inputs
+        self.data_source = widgets.ToggleButtons(
+            options=["Snapshot", "Live BQL"],
+            value="Snapshot",
+            description="Data:",
+        )
+        self.policy_rate = widgets.FloatText(
+            value=DEFAULT_POLICY_RATE,
+            description="Policy:",
+            layout=widgets.Layout(width="210px"),
+        )
+        self.overnight_anchor = widgets.FloatText(
+            value=DEFAULT_EFFECTIVE_OVERNIGHT,
+            description="Effective O/N:",
+            layout=widgets.Layout(width="235px"),
+        )
+
+        # Trade inputs
+        self.trade_tenor = widgets.Dropdown(
+            options=list(TRADE_TENORS),
+            value="6M",
+            description="OIS tenor:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.direction = widgets.Dropdown(
+            options=["Pay fixed", "Receive fixed"],
+            value="Pay fixed",
+            description="Direction:",
+            layout=widgets.Layout(width="230px"),
+        )
+        self.notional = widgets.FloatText(
+            value=100_000_000.0,
+            description="Notional TRY:",
+            layout=widgets.Layout(width="260px"),
+        )
+
+        self.refresh_button = widgets.Button(
+            description="Refresh market",
+            button_style="info",
+            icon="refresh",
+        )
+        self.reprice_button = widgets.Button(
+            description="Reprice scenario",
+            button_style="success",
+            icon="check",
+        )
+        self.export_button = widgets.Button(
+            description="Export",
+            icon="download",
+        )
+
+        # Scenario entry rows
+        self.move_inputs = []
+        for date in MEETING_DATES:
+            self.move_inputs.append(
+                widgets.FloatText(
+                    value=0.0,
+                    description=date.strftime("%d %b %Y"),
+                    layout=widgets.Layout(width="245px"),
+                )
+            )
+
+        # Technical assumptions hidden by default
+        self.basis = widgets.FloatText(
+            value=DEFAULT_OVERNIGHT_POLICY_BASIS_BPS,
+            description="O/N-policy basis bp:",
+            layout=widgets.Layout(width="300px"),
+        )
+        self.move_size = widgets.FloatText(
+            value=self.settings.standard_move_bps,
+            description="Standard move bp:",
+            layout=widgets.Layout(width="280px"),
+        )
+        self.smoothing = widgets.FloatText(
+            value=self.settings.smoothness_lambda,
+            description="Smooth λ:",
+            layout=widgets.Layout(width="250px"),
+        )
+
+        self.assumptions_box = widgets.VBox([
+            widgets.HTML(
+                "<b>Technical controls — model governance, not normal daily inputs</b>"
+            ),
+            widgets.HBox([self.basis, self.move_size, self.smoothing]),
+            widgets.HTML(
+                "Curve interpolation: shape-preserving interpolation of log discount factors. "
+                "Policy interpolation: none; the policy path is stepwise."
+            ),
+        ])
+        self.assumptions = widgets.Accordion(children=[self.assumptions_box])
+        self.assumptions.set_title(0, "Model assumptions and diagnostics")
+
+        # Outputs
+        self.summary_out = widgets.Output()
+        self.market_curve_out = widgets.Output()
+        self.table_out = widgets.Output()
+        self.chart_out = widgets.Output()
+        self.diagnostics_out = widgets.Output()
+        self.export_out = widgets.Output()
+
+        self.refresh_button.on_click(lambda _: self.run(refresh=True))
+        self.reprice_button.on_click(lambda _: self.run(refresh=False))
+        self.export_button.on_click(lambda _: self.export_excel())
+
+    def current_settings(self) -> ModelSettings:
+        return ModelSettings(
+            day_count_basis=360,
+            standard_move_bps=float(self.move_size.value),
+            smoothness_lambda=max(float(self.smoothing.value), 0.0),
+            max_fit_error_warning_bps=5.0,
+        )
+
+    def load_market(self):
+        if self.data_source.value == "Live BQL":
+            self.quotes = TurkeyOISData.live()
+            self.policy_rate.value = TurkeyOISData.live_policy_rate()
+        else:
+            self.quotes = TurkeyOISData.snapshot()
+
+    def user_moves(self) -> List[float]:
+        return [float(widget.value) for widget in self.move_inputs]
+
+    def run(self, refresh: bool = False):
+        with self.summary_out:
+            clear_output()
+            display(HTML("<b>Loading market data and calibrating the meeting path...</b>"))
+
+        try:
+            settings = self.current_settings()
+
+            if refresh or self.quotes is None:
+                self.load_market()
+                self.curve, self.logdf_fn = ShortOISCurve.build(
+                    self.quotes, settings
+                )
+
+                (
+                    self.market_path,
+                    self.diagnostics,
+                    self.boundaries,
+                    self.market_overnight_rates,
+                ) = MeetingStepPath.calibrate(
+                    self.logdf_fn,
+                    float(self.overnight_anchor.value),
+                    float(self.policy_rate.value),
+                    float(self.basis.value),
+                    settings,
+                )
+
+            self.user_path = ScenarioAndTrade.scenario_path(
+                self.market_path,
+                float(self.policy_rate.value),
+                float(self.basis.value),
+                self.user_moves(),
+            )
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            self.trade_result = ScenarioAndTrade.trade_metrics(
+                self.logdf_fn,
+                TRADE_TENORS[self.trade_tenor.value],
+                self.boundaries,
+                scenario_rates,
+                float(self.notional.value),
+                self.direction.value,
+                settings,
+            )
+
+            self.render_summary(settings)
+            self.render_market_curve()
+            self.render_table()
+            self.render_chart()
+            self.render_diagnostics()
+
+        except Exception as exc:
+            import traceback
+            with self.summary_out:
+                clear_output()
+                display(HTML(
+                    "<h3 style='color:#b00020'>Calibration or rendering error</h3>"
+                    f"<pre>{traceback.format_exc()}</pre>"
+                ))
+
+    def render_summary(self, settings: ModelSettings):
+        with self.summary_out:
+            clear_output()
+
+            first = self.market_path.iloc[0]
+            trade = self.trade_result.iloc[0]
+            max_error = self.diagnostics.loc[self.diagnostics["use"] == "Calibration", "fit_error_bps"].abs().max()
+
+            display(HTML(
+                f"""
+                <div style="border:1px solid #777;padding:14px;border-radius:8px;">
+                  <h2 style="margin-top:0;">Turkey OIS Policy Pricer</h2>
+                  <b>As of:</b> {AS_OF_DATE.date()} &nbsp; | &nbsp;
+                  <b>Policy:</b> {self.policy_rate.value:.2f}% &nbsp; | &nbsp;
+                  <b>Effective O/N:</b> {self.overnight_anchor.value:.2f}%<br><br>
+
+                  <b>Next meeting ({first['meeting_date'].date()}):</b>
+                  {first['market_move_bps']:+.0f} bp implied,
+                  policy-equivalent rate {first['market_policy_rate']:.2f}%<br>
+
+                  <b>Selected trade:</b> {self.direction.value} {self.trade_tenor.value}
+                  on TRY {self.notional.value:,.0f}<br>
+                  <b>Market rate:</b> {trade['market_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Scenario fair:</b> {trade['scenario_fair_rate']:.3f}% &nbsp; | &nbsp;
+                  <b>Gap:</b> {trade['scenario_minus_market_bps']:+.1f} bp<br>
+                  <b>DV01:</b> TRY {trade['dv01_try_per_bp']:,.0f}/bp &nbsp; | &nbsp;
+                  <b>Scenario P&amp;L:</b> TRY {trade['scenario_pv_try']:,.0f}<br><br>
+
+                  <b>Calibration max error (1W–6M):</b> {max_error:.2f} bp<br>
+                  <span style="font-size:0.92em;">
+                    9M and 1Y are validation-only until the 2027 CBRT meeting calendar is loaded.
+                    Trades marked * use a flat post-December overnight-rate assumption.
+                  </span>
+                </div>
+                """
+            ))
+
+    def render_table(self):
+        with self.table_out:
+            clear_output()
+
+            table = self.market_path[[
+                "meeting_date",
+                "market_move_bps",
+                "market_policy_rate",
+            ]].copy()
+            table["user_move_bps"] = self.user_moves()
+            table["user_policy_rate"] = self.user_path["user_policy_rate"]
+            table["user_minus_market_bps"] = self.user_path[
+                "user_minus_market_bps"
+            ]
+
+            table = table.rename(columns={
+                "meeting_date": "CBRT meeting",
+                "market_move_bps": "Market move (bp)",
+                "market_policy_rate": "Market policy (%)",
+                "user_move_bps": "User move (bp)",
+                "user_policy_rate": "User policy (%)",
+                "user_minus_market_bps": "User - market (bp)",
+            })
+
+            display(HTML("<h3>Market-implied path vs user scenario</h3>"))
+            display(table.round(2).reset_index(drop=True))
+
+    def render_market_curve(self):
+        """Display the actual smooth short-end OIS market curve."""
+        with self.market_curve_out:
+            clear_output()
+
+            settings = self.current_settings()
+            dense_days = np.arange(7, 366)
+            dense_rates = [
+                ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, int(day), settings
+                )
+                for day in dense_days
+            ]
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=dense_days,
+                y=dense_rates,
+                mode="lines",
+                name="Interpolated OIS curve",
+                hovertemplate="Day %{x}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=self.curve["days"],
+                y=self.curve["par_rate"],
+                mode="markers+text",
+                text=self.curve["tenor"],
+                textposition="top center",
+                name="Market quotes",
+                marker={"size": 9},
+                hovertemplate="%{text}<br>OIS %{y:.3f}%<extra></extra>",
+            ))
+            fig.update_layout(
+                title="1. TRY short-end OIS market curve",
+                xaxis_title="Days to maturity",
+                yaxis_title="Par OIS rate (%)",
+                height=410,
+                hovermode="x unified",
+                margin={"l": 65, "r": 35, "t": 65, "b": 55},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>This is the actual market curve.</b> The dots are the quoted "
+                "1W–1Y OIS instruments. The smooth line comes from "
+                "shape-preserving interpolation of <i>log discount factors</i>."
+                "</div>"
+            ))
+
+    def render_chart(self):
+        with self.chart_out:
+            clear_output()
+
+            settings = self.current_settings()
+            scenario_rates = ScenarioAndTrade.scenario_segment_rates(
+                self.user_path,
+                float(self.overnight_anchor.value),
+            )
+
+            repricing_rows = []
+            for tenor, days in TRADE_TENORS.items():
+                market_rate = ShortOISCurve.bullet_par_rate(
+                    self.logdf_fn, days, settings
+                )
+                scenario_rate = ScenarioAndTrade.bullet_par_rate_from_steps(
+                    days,
+                    self.boundaries,
+                    scenario_rates,
+                    settings,
+                )
+                repricing_rows.append({
+                    "tenor": tenor,
+                    "market_rate": market_rate,
+                    "scenario_rate": scenario_rate,
+                    "difference_bps": (scenario_rate - market_rate) * 100.0,
+                })
+            repricing = pd.DataFrame(repricing_rows)
+
+            fig = make_subplots(
+                rows=1,
+                cols=2,
+                subplot_titles=(
+                    "2. Market-implied CBRT path vs user scenario",
+                    "3. OIS curve under the user scenario",
+                ),
+                horizontal_spacing=0.12,
+            )
+
+            market_dates = [AS_OF_DATE] + self.market_path["meeting_date"].tolist()
+            market_rates = [float(self.policy_rate.value)] + self.market_path[
+                "market_policy_rate"
+            ].tolist()
+            user_dates = [AS_OF_DATE] + self.user_path["meeting_date"].tolist()
+            user_rates = [float(self.policy_rate.value)] + self.user_path[
+                "user_policy_rate"
+            ].tolist()
+
+            fig.add_trace(go.Scatter(
+                x=market_dates,
+                y=market_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="Market-implied policy",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=user_dates,
+                y=user_rates,
+                mode="lines+markers",
+                line_shape="hv",
+                name="User scenario",
+                hovertemplate="%{x|%d %b %Y}<br>%{y:.2f}%<extra></extra>",
+            ), row=1, col=1)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["market_rate"],
+                mode="lines+markers",
+                name="Current market OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.add_trace(go.Scatter(
+                x=repricing["tenor"],
+                y=repricing["scenario_rate"],
+                mode="lines+markers",
+                name="Scenario fair OIS",
+                hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>",
+            ), row=1, col=2)
+
+            fig.update_yaxes(
+                title_text="Policy-equivalent rate (%)",
+                row=1,
+                col=1,
+            )
+            fig.update_xaxes(title_text="CBRT meeting date", row=1, col=1)
+            fig.update_yaxes(title_text="Par OIS rate (%)", row=1, col=2)
+            fig.update_xaxes(title_text="OIS tenor", row=1, col=2)
+
+            fig.update_layout(
+                title="Policy path and scenario transmission into the OIS curve",
+                height=500,
+                hovermode="x unified",
+                legend={"orientation": "h", "y": -0.18},
+                margin={"l": 65, "r": 35, "t": 85, "b": 100},
+            )
+            fig.show()
+
+            display(HTML(
+                "<div style='padding:8px 0 14px 0;'>"
+                "<b>Left:</b> policy is constant between meetings and jumps only "
+                "on a CBRT date. <b>Right:</b> the user scenario is translated "
+                "back into fair 1M–1Y OIS rates."
+                "</div>"
+            ))
+
+    def render_diagnostics(self):
+        with self.diagnostics_out:
+            clear_output()
+            display(HTML("<h3>Short-end curve and calibration diagnostics</h3>"))
+            display(self.curve[[
+                "tenor",
+                "ticker",
+                "par_rate",
+                "discount_factor",
+                "source",
+            ]].round(8))
+            display(self.diagnostics.round(4))
+            display(HTML(
+                "<b>Interpretation:</b> interpolation is used only between market "
+                "discount-factor nodes. The policy path itself is not interpolated; "
+                "it remains constant between CBRT meetings. The solver uses 1W–6M "
+                "quotes jointly. 9M and 1Y are shown only as validation until the "
+                "2027 CBRT calendar is added."
+            ))
+
+    def export_excel(self):
+        with self.export_out:
+            clear_output()
+            if self.trade_result is None:
+                display(HTML("<b>Run the pricer first.</b>"))
+                return
+
+            path = Path.cwd() / "turkey_ois_policy_pricer_v4.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                self.quotes.to_excel(writer, sheet_name="market_quotes", index=False)
+                self.curve.to_excel(writer, sheet_name="discount_curve", index=False)
+                self.market_path.to_excel(writer, sheet_name="market_path", index=False)
+                self.user_path.to_excel(writer, sheet_name="user_scenario", index=False)
+                self.trade_result.to_excel(writer, sheet_name="selected_trade", index=False)
+                self.diagnostics.to_excel(writer, sheet_name="diagnostics", index=False)
+
+            display(FileLink(str(path)))
+
+    def display(self):
+        display(Markdown("""
+# Turkey OIS Policy Pricer — constrained meeting calibration
+
+Use the meeting boxes to enter your CBRT scenario. The tool compares it with
+the market-implied path and reprices one selected short-dated OIS trade.
+"""))
+
+        header = widgets.VBox([
+            widgets.HBox([
+                self.data_source,
+                self.policy_rate,
+                self.overnight_anchor,
+                self.refresh_button,
+            ]),
+            self.summary_out,
+        ])
+
+        scenario_grid = widgets.GridBox(
+            children=self.move_inputs,
+            layout=widgets.Layout(
+                grid_template_columns="repeat(2, 260px)",
+                grid_gap="4px 20px",
+            ),
+        )
+
+        trade_controls = widgets.HBox([
+            self.trade_tenor,
+            self.direction,
+            self.notional,
+            self.reprice_button,
+            self.export_button,
+        ])
+
+        display(header)
+        display(self.market_curve_out)
+        display(HTML("<h3>2. Enter your CBRT meeting scenario, in basis points</h3>"))
+        display(scenario_grid)
+        display(HTML("<h3>3. Select the OIS trade to reprice</h3>"))
+        display(trade_controls)
+        display(self.table_out)
+        display(self.chart_out)
+        display(self.assumptions)
+        display(self.diagnostics_out)
+        display(self.export_out)
+
+        # Initial calibration is deliberately launched from a separate notebook
+        # cell so the widget shell renders even if calibration raises an error.
+
+
+
+
