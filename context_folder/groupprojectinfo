@@ -1,0 +1,559 @@
+Agenda- Group Project 
+
+Build a consistent implied monetary policy pricer for global EM rates (and ideally developed markets too), replacing reliance on Bloomberg MIPR. The intern is expected to: (1) work with cross-regional sponsors to agree the markets in scope (starting with Latam, CE3, Turkey, and extending to Asia and Africa); (2) for each market, identify the correct instruments to use (swaps, FRA, bonds, or a combination) and the right interpolation methods; (3) build a pricer that shows implied pricing per central bank meeting date (not just fixed horizons); (4) expose the underlying assumptions so users can change them; and (5) as an extension, allow users to enter specific central bank policy path scenarios and compute “fair value” against them. Users span research, sales, and trading, so the tool should be accessible to all three. 
+
+ 
+
+Expose the underlying assumptions so users can change them: 
+
+Ex: Right now MIPR just shows Brazil 1y implied rate = x%. but you don’t know which instruments were used, which interpolation, which day count, whether policy changes are assumed only at meetings, how the first fixing is handled  
+
+Main purpose of this tool --- allow users to express and test their views  
+
+Questions to ask: 
+
+Could you walk us through a real example of how you would use this tool? Suppose you had a strong view on X or Y country, what workflow do you imagine  
+
+ 
+
+Agree on markets in scope (cross regional sponsors) 
+
+Who are these regional sponsors 
+
+Does each currency use multiple instruments or should we research which instrument is most common for each EM? 
+
+Is it based on what instruments are most liquid in that market? 
+
+Should users be able to choose btw swaps, bonds, futures as the curve course  
+
+Build out  
+
+Can we download central bank meeting dates from Bloomberg? 
+
+How far in advance do they want to see implied rates (1 year 5 year)? 
+
+Rate hike or rate cut? For underlying assumptions (GDP, unemployment, inflation, labour data) (Hawkish or dovish) 
+
+What are these policy path scenarios? 
+
+Where do we derive fair value?  
+
+Given your policy path, what should the market instrument be worth?  
+
+Background Info to Know: 
+
+Swaps 
+
+FRA: forward rate agreement 
+
+Bonds 
+
+ 
+
+What goes into predicting global interest rates? - combination of macro conditions and monetary policy decisions 
+
+Analyzing macro data  
+
+CPI 
+
+Personal consumption expenditures 
+
+Labor markets- unemployment, new jobs 
+
+Tracking central bank policies 
+
+Read the bond market (yield curve) 
+
+Inverted curve= short-term rates are higher than long term rates 
+
+Aggregate Expert Forecasting Models: 
+
+Track economic calendars (trading economics calendar) 
+
+OECD Projections (long-term government bond yields) 
+
+ 
+
+Underlying assumptions built-in: 
+
+Hawkish vs. Dovish expectation  
+
+Expected inflation changes 
+
+GDP change 
+
+Currency appreciation vs. depreciation 
+
+ 
+
+ 
+
+ 
+
+Latam: 
+
+Mexico (TIIE-F-RFR) 
+
+Chile (193 ) 
+
+Colombia (329) 
+
+CE3: 
+
+Hungary (324?) -confirm 
+
+Poland (327) 
+
+Turkey (522) 
+
+Asia: 
+
+India (266) 
+
+Indonesia (S158 )- OIS curve- confirm? 
+
+Thailand (552) 
+
+Malaysia (209) 
+
+Philippines (370)- confirm? 
+
+Curve Numbers: 
+
+TWD -S 203 
+CNY – S 204 
+KRW – S 205 
+INR – S 266 
+SGD: S527 
+THB: S 552 
+MYR: S 209 
+
+ 
+
+Core Economic Indicators to build into our model: 
+
+GDP 
+
+Unemployment rate 
+
+Inflation rate 
+
+Interest rates 
+
+Trade balance (difference between exports and imports) (surplus vs deficit) 
+
+Government debt to GDP 
+
+FOUND at International Monetary Fund | IMF  
+
+Can pull an excel file on data for these countries 
+
+ 
+
+____________________________________________________ 
+
+Notes from meeting with Gordian 
+
+People to connect with: 
+
+Arup Ghosh  
+
+Marcos Ang  
+
+Asian CB pricers 
+
+Singapore 
+
+Ethan Lester 
+
+London  
+
+**Check the loan market compendium on website 
+
+Tool that can derive from instruments what market prices in for each CB meeting, derived from the curve  
+
+Concept of smooth curve, work w/ discount factors, weight of future payment in todays terms 
+
+Concavity – can't do linear interpolation because it underestimates 
+
+Exponential spline  
+
+Bootstrapping of a curve  
+
+ 
+
+What Gordian sees as the UI of this tool: 
+
+Wants to be able to “reverse it” 
+
+Trying to solve what is market implied fair value  
+
+Wants “what if” scenario analysis  
+
+Ex: You are long X, you think CB will hike, what is your risk 
+
+How will 1 yr change if you change the scenario  
+
+Sheet where you can update the what if  
+
+Use WIRP Chile as example  
+
+Showing what the interest rate market is pricing for Chile’s CB policy path using Overnight Index Swaps (OIS) 
+
+OIS is a derivative where to parties exchange: 
+
+Fixed rate (what the market implies) 
+
+Floating rate (the realized overnight rate, compounded over time) 
+
+#Hikes/Cuts (Expressed in number of 25bp moves” priced in); +1.0 = 1 full hike (25bp) 
+
+-0.282 --> means ~28% probability of a 25 bp cut  
+
++0.200 --> ~20% chance of a 25bp hike  
+
+-0.664 --> ~66% chance of a 25 bp cut  
+
+%Hike/Cut (Expressed as a percentage probability) 
+
+Implied Rate  
+
+The market-implied policy rate after that meeting  
+
+ 
+
+ 
+
+ 
+
+Blue line = implied overnight rate (shows expected path over time) 
+
+Orange bars = number of hikes/cuts priced  
+
+Negative bars = cuts 
+
+Positive bars = hikes 
+
+Market expects easing overall, but with some uncertainty and volatility in the path  
+
+Near term (july) -- market expects no change  
+
+September (leaning toward a rate cut, ~30% priced) 
+
+October (some chance of a hike, suggesting uncertainty/data dependence) 
+
+December (Strong expectation of cuts, ~66% probability of easing) 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+CLP OIS curve builder 
+
+Cash rate (anchor) 
+
+1 Day: 4.50 / 4.50  
+
+Current overnight policy rate 
+
+Starting point of the entire curve 
+
+No Futures / FRAs 
+
+Chile doesn’t have liquid short-term futures  
+
+So the curve relies almost entirely on OIS swaps 
+
+Swap rates (core inputs)  
+
+OIS swap rates from 1 month to 20 years 
+
+These are the fixed rates at which the market is willing to swap versus overnight CLP 
+
+They embed expectations of future short-term rates 
+
+Zero rate curve 
+
+Shows zero rates (spot rates) derived from those swaps 
+
+Upward sloping curve --> the market expects higher average rates in the long run than today 
+
+ 
+
+ 
+
+WIRP 
+
+US: Fut, OIS <-- try with this  
+
+EM will be swap based  
+
+Try to replicate Chile --> understand Colombia 
+
+Chile: if 3month, but no 1m, 2m --> have to make an assumption. Extrapolate to get 1m from 3m 
+
+**He is interested in at least 1yr dates ahead  
+
+ 
+
+MIPR 
+
+US is a benchmark  
+
+***Want for LATAM, Mexico, Chile  
+
+Mexico has funky definitions  
+
+28 days month (Aztec calendar) 
+
+TIIE = Interbank swap rate, based on 28 days  
+
+1yr = 364 days  
+
+10 yr is missing out on 12 days  
+
+***Need to factor in basis  
+
+ 
+
+MXSW 
+
+MPSW 
+
+F10J        MXN OIS 130 x 1  
+
+10 yrs, 28 days 
+
+CG --- gives the curve  
+
+Green = current  
+
+5583 = name of curve 
+
+Mid YTM  
+
+FWCM – fwd curve matrix  
+
+Curve list 
+
+Starts with 1 yr, need to find 1m  
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+CDIE (Brazil) 
+
+ 
+
+Mexico 
+
+Swap curve --- implied pricing hidden in swap curve 
+
+20 day horizon  
+
+If you can call a fwd for next meeting, what is curr forward starting in day after that meeting  
+
+If higher or lower, take difference  
+
+ 
+
+Spot --> S(0,T) 
+
+              Spot(today, 1m) 
+
+Fwd --> f(0,t,T)  
+
+Needs expiration  
+
+Looking for 1m fwds starting from CB date  
+
+2y rate 
+
+1yr rate  
+
+1y1y ---> (1+f2)^2 = (1+f1)^1 (1+f1,1)^1                No arbitrage condition  
+
+ 
+
+ 
+
+Option to change curve source 
+
+CRVF (curve fitting, pick country, then pick curve) 
+
+Table for tickers 
+
+ 
+
+LATAM : 
+
+ 
+
+Assumptions for Colombia 
+
+Country 
+
+ 
+
+Curve Source 
+
+ OIS 
+
+Policy anchor 
+
+ 
+
+Valuation date (as of today) 
+
+ 
+
+Forward window (if meetings are monthly or not (ex: 28 days after each meeting) 
+
+Meet 8 times a year 
+
+Day Count   
+
+ACT/365 
+
+Interpolation (pchip) 
+
+ 
+
+Standard move (how many bps) 
+
+ 
+
+Basis  
+
+ 
+
+Scenario preset  
+
+ 
+
+Fair Value Method 
+
+ 
+
+ 
+
+ 
+
+Assumptions for Chile – 6 months 
+
+Country 
+
+CHILE 
+
+Curve Source 
+
+CLP Camara IRS Curve 
+
+Policy anchor 
+
+ 
+
+Valuation date (as of today) 
+
+ 
+
+Forward window (if meetings are monthly or not (ex: 28 days after each meeting) 
+
+Day Count   
+
+ACT/360 
+
+Interpolation (pchip) 
+
+ 
+
+Standard move (how many bps) 
+
+ 
+
+Basis  
+
+ 
+
+Scenario preset  
+
+ 
+
+Fair Value Method 
+
+ 
+
+ 
+
+Mexico Pricer (prototype) 
+
+Pulls the live TIIE-F RFR curve from Bloomberg using BQL and builds a continuous curve by interpolating between the quoted swap maturities so we can calculate forwards on any date, including Banxico meeting dates 
+
+Those forwards are then inverted to derive the market-implied policy path, let the user override it with a custom scenario, and reprice the curve to produce fair values  
+
+Next step is to bootstrap the curve  
+
+Policy anchor = current Banxico target overnight policy rate 
+
+Pull using MXONBR Index  
+
+ 
+
+ 
+
+ 
+
+------ 
+
+ICVS:  
+
+TWD – 203 
+
+CNY – 204 
+
+KRW – 205 
+
+INR - 266 
+
+ 
+
+ 
+
+Steps: 
+
+Build the curve 
+
+Derive forward rates and discount factors 
+
+Solve for post-meeting overnight rate using the compounded relationship that Bloomberg’s MIPR uses 
+
+Pre meeting O/N return x post meeting O/N return   
+
+ 
