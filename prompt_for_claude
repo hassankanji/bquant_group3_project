@@ -1,0 +1,32 @@
+1. Task
+  - We need to create a Bquant app that coded in an ipynb in Bquant that pulls data from bloomberg using bql queries in order to create a implied monetary policy pricer
+  - so we need to be able to see for all these different countires what is the interest rate hike/cut implied to be after each meeting based on the curve of that country
+  - there are further requirements, all viewable in the context_folder where you can read through groupprojectnotes and see what the task is
+  - this is essentially bloomberg MIPR but for more countires and with better features - look online to see this for context - it is a good foundation to build on
+  -  heres the prompt they gave us: Build a consistent implied monetary policy pricer for global EM rates (and ideally developed markets too), replacing reliance on Bloomberg MIPR. The intern is expected to: (1) work with cross-regional sponsors to agree the markets in scope (starting with Latam, CE3, Turkey, and extending to Asia and Africa); (2) for each market, identify the correct instruments to use (swaps, FRA, bonds, or a combination) and the right interpolation methods; (3) build a pricer that shows implied pricing per central bank meeting date (not just fixed horizons); (4) expose the underlying assumptions so users can change them; and (5) as an extension, allow users to enter specific central bank policy path scenarios and compute “fair value” against them. Users span research, sales, and trading, so the tool should be accessible to all three.
+
+2. Context
+  - The context is provided for you so that you can see what we tried, resources weve recived and notes weve taken throughout the process
+  - look through the context for ideas, infomration you need about curve numbers and using bql, and anything else you might find useful in there
+  - however, note that the context is not perfect there could be mistakes in there or there could be better ways to proceed. therefore do not rely only on the context, also use your own understanding and online resources or whatever else in order to determine what is best for the project
+  - math in the context is confusing - we dont know exactly what is going on with interpolaiton and all that so it should be correct, consistent, and explainable
+  
+3. Specific things to add/be aware of that the context doesn't do
+  - there are a number of things we have struggled to do that we need you to do in the final output
+  a. Visually/UI
+    - it should look pretty when ran in a BQAP environment and should be simple to use
+    - it should not be overcluttered with fluff and uncessary information it should be simple to use and to the point, ideally with key information on one graph/table
+    - do not overclutter with uncessary information and so many tabs - it should be a relatively simple tool however do include all ncessary informatin and if that takes space then so be it
+    
+  b. Features
+    - it needs a dropdown menu to select different countries - all our examples are just one country each - we need to be doing all the countries in one program so the uesr can click through them
+    - it needs to allow the user to input assumptions - i.e. what will happen to the rest of the implied rate hike/cuts if the upcoming meeting is a 25 bp hike - this should be intuitive to use and clean
+    - all data needs to be live and accurate
+    - the calendar conventions for different countires should be right, and we should be using the right curve
+    - the meeting dates for central bank meetings should be accurate
+    - look through the notes to see what the countires in context that we are doing are
+    
+  c. Math
+    - the math should be both simple to understand and explain and also robust and accurate
+    - include a section similar to bloombergs help page for different functions - somewhere that explains methodology in a nice way with formulas and graphs that are easy to understand, explain, and present
+    
