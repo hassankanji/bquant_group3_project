@@ -1,0 +1,408 @@
+<a id="bql-for-wirp-top"></a>
+# Sample Notebook: Implied Overnight Rate Curve Evolution
+
+This example creates a chart showing the implied overnight rate curve with expected cuts or hikes at different points in time, allowing you to analyze the impact of certain events on rate expectations. This implicit policy rate is available for a number of countries and is derived from futures and swaps prices. The visuals complement the charts featured in the [Doubting America Can Still Cost You a Lot of Money](bbg://screens/nsn%20SQ0GLXDWLU68) and [Why We’re in 'Trading Places' Territory](bbg://screens/nsn%20SVEWQ7DWLU68) articles by John Authers.
+
+The results are presented as:
+
+1. A Plotly suplot displaying on each of the reference dates:
+    - The implied overnight rate curve.
+    - The number of cumulative rate hikes or cuts.
+
+**Interactive Features**
+* Use the input widgets to set:
+    * The country of choice.
+    * The model used for the implied rate calculation.
+    * The anticipated meeting date range.
+    * The as of dates for the analysis.
+
+Click **Run all** (<i class="fas fa-forward"></i>) at the top of this window to see the output.
+
+# Set up your environment
+from datetime import date
+from dateutil.relativedelta import relativedelta
+
+import ipywidgets as widgets
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+import bql
+
+# Instantiate the connection to BQL
+bq = bql.Service()
+
+# Country to country ticker mapping
+country_tickers_mapping = {
+    'Australia': 'AU Country',
+    'Canada': 'CA Country',
+    'Chile': 'CL Country',
+    'Eurozone': 'EZ Country',
+    'India': 'IN Country',
+    'Japan': 'JP Country',
+    'New Zealand': 'NZ Country',
+    'Norway': 'NO Country',
+    'Sweden': 'SE Country',
+    'Switzerland': 'CH Country',
+    'United Kingdom': 'GB Country',
+    'United States': 'US Country'
+}
+
+# Country to rate model mapping. Other countries will default to just the
+# OIS model
+country_model_mapping = {
+    'United States': ['FUT', 'OIS'],
+    'Australia': ['FUT', 'OIS'],
+}
+
+def get_country_model(country):
+    return country_model_mapping.get(country, ['OIS'])
+
+# Set default values for meeting dates range
+today = date.today()
+start_date = today - relativedelta(weeks=8)
+end_date = today + relativedelta(years=1)
+
+# Set default values for as of dates
+as_of_date_1 = today
+as_of_date_2 = today - relativedelta(weeks=12)
+as_of_date_3 = today - relativedelta(weeks=24)
+
+# Function to get the implied overnight rate data
+def get_period_reference_from_date(date):
+    """
+    Converts a date to the required format for the period_reference 
+    parameter of the implied_overnight_rate data item.
+    """
+    return f'{date:%YM%#m}'
+
+
+def get_data_as_of_date(universe, model, start_date, end_date, as_of_date):
+    """
+    Returns a DataFrame containing the path of the implied overnight rate 
+    using the selected model, as of a single as of date.
+    """
+    start = get_period_reference_from_date(start_date)
+    end = get_period_reference_from_date(end_date)
+    
+    data_item = {
+        'implied_overnight_rate': bq.data.implied_overnight_rate(
+            as_of_date=as_of_date, 
+            model=model,
+            period_reference=bq.func.range(start, end),
+            fill='prev',
+        )
+    }
+    request = bql.Request(universe, data_item)
+
+    response = bq.execute(request)
+    df = response[0].df().dropna(subset=['implied_overnight_rate'])
+
+    # Only retain estimate rows, since any effective rate data is returned
+    # over the required range using get_effective_date()
+    df = df[
+        (df['ACT_EST_DATA'] == 'E') 
+        & (df['MEETING_DATE'] >= start_date.strftime("%Y-%m-%d"))
+    ]
+
+    return df
+
+
+def get_data_all_as_of_dates(universe, model, start_date, end_date, as_of_dates):
+    """
+    Returns a DataFrame containing the path of the implied overnight rate 
+    using the selected model, for all as of dates.
+    """
+
+    dfs_list = [
+        get_data_as_of_date(universe, model, start_date, end_date, as_of_date)
+        for as_of_date in as_of_dates
+    ]
+
+    return pd.concat(dfs_list)
+
+
+def get_effective_rate(universe, model, start_date):
+    """
+    Returns a DataFrame containing the effective rate using the selected
+    model over the entire meeting range.
+    """
+    data_item = {
+        'effective_rate': bq.data.implied_overnight_rate(
+            model=model,
+            dates=bq.func.range(start_date, today),
+            fill='prev',
+        )
+    }
+    request = bql.Request(universe, data_item)
+
+    response = bq.execute(request)
+    df = response[0].df()
+
+    return df
+
+colors = [
+    'rgb(0,113,253)',
+    'rgb(255,255,255)',
+    'rgb(159,159,159)'
+]
+
+def build_subplot(df, effective_rate_df, as_of_dates):
+    """
+    Builds a Plotly subplot displaying the path of the implied overnight rate 
+    for each of the reference dates over the meeting range along with the 
+    number of implied moves.
+    """
+    line_traces = build_line_traces(df, effective_rate_df, as_of_dates)
+    bar_traces = build_bar_traces(df, as_of_dates)
+    combined = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.75, 0.25],
+        vertical_spacing=0.05
+    )
+
+    # Add the traces
+    for trace in line_traces:
+        combined.add_trace(trace, row=1, col=1)
+
+    for trace in bar_traces:
+        combined.add_trace(trace, row=2, col=1)
+    
+    fig = go.FigureWidget(combined)
+    
+    fig.update_yaxes(title_text="Implied Overnight Rate", row=1, col=1)
+    fig.update_yaxes(title_text="# Hikes/Cuts", row=2, col=1)
+    
+    fig.update_layout(
+        template='plotly_dark',
+        margin=dict(t=80, r=0, l=0, b=0),
+        height=600, 
+        title='Interest Rate Probability Paths',
+        legend={'orientation':'h', 'yanchor': 'bottom', 'y': 1.02, 'x': 0.02},
+        hovermode='x unified',
+        barmode='group',
+        hoverlabel=dict(namelength=-1)
+    )
+
+    # Add vertical line and annotation to represent today's date
+    for r in [1, 2]:
+        fig.add_vline(
+            x=today.strftime("%Y-%m-%d"),
+            line_width=1,
+            line_dash="dot",
+            line_color="orange",
+            row=r,
+            col=1
+        )
+
+    fig.add_annotation(
+        x=today.strftime("%Y-%m-%d"),
+        y=0.98,                     
+        yref="y domain",
+        xanchor="left",
+        yanchor="bottom",
+        text="Today",
+        showarrow=False,
+        font=dict(color="orange"),
+        row=1,
+        col=1
+    )
+
+    return fig
+    
+
+def build_bar_traces(df, as_of_dates):
+    """
+    Returns a list of bar traces displaying the number of impiled overnight 
+    rate moves for each of the reference dates.
+    """
+    traces = []
+    # Add data for each as of date as a separate trace to the chart
+    for as_of_date, color in zip(as_of_dates, colors):
+        as_of_str = as_of_date.strftime("%Y-%m-%d")
+        temp = df[df['AS_OF_DATE'] == as_of_str]
+        traces.append(
+            go.Bar(
+                x=temp['MEETING_DATE'],
+                y=pd.to_numeric(temp["NUMBER_OF_MOVES"], errors="coerce"),
+                name=f'As of {as_of_str}',
+                marker={'color': color}, 
+                showlegend=False,
+                legendgroup=as_of_str
+            )
+        )
+    return traces
+
+
+def build_line_traces(df, effective_rate_df, as_of_dates):
+    """
+    Returns a list of line traces displaying the path of the implied overnight
+    rates for each of the reference dates.
+    """
+    traces = []
+    # Add data for each as of date as a separate trace to the chart using only
+    # the estimated rates
+    for as_of_date, color in zip(as_of_dates, colors):
+        as_of_str = as_of_date.strftime("%Y-%m-%d")
+        temp = df[df['AS_OF_DATE'] == as_of_str]
+        traces.append(
+            go.Scatter(
+                x=temp['MEETING_DATE'],
+                y=temp['implied_overnight_rate'],
+                name=f'As of {as_of_str}',
+                line={'color': color},
+                mode='lines+markers',
+                legendgroup=as_of_str,
+            )
+        )
+
+    # Add the series for the effective rate
+    if not effective_rate_df.empty:
+        traces.append(
+            go.Scatter(
+                x=effective_rate_df['AS_OF_DATE'],
+                y=effective_rate_df['effective_rate'],
+                name='Effective rate',
+                line={'color': 'lightgreen', 'width': 1, 'dash': 'dash'},
+                mode='lines'
+            )
+        )
+    
+    return traces
+
+# Create dropdowns for country and model selection and date pickers to choose
+# meeting range and as of dates
+country_dropdown = widgets.Dropdown(
+    options=country_tickers_mapping, 
+    label='United States', 
+    description='Country:', 
+    layout={'width': '190px'}, 
+    style={'description_width': 'initial'}
+)
+
+model_dropdown = widgets.Dropdown(
+    options=get_country_model(country_dropdown.label),
+    value='FUT', 
+    description='Model:', 
+    layout={'width': '130px'}, 
+    style={'description_width': 'initial'}
+)
+
+# Date picker arguments
+width = {'width': '120px'}
+kwargs = {
+    'layout': width,
+    'max': today
+}
+
+meeting_start_picker = widgets.DatePicker(value=start_date, layout=width)
+meeting_end_picker = widgets.DatePicker(value=end_date, layout=width)
+as_of_date_1_picker = widgets.DatePicker(value=as_of_date_1, **kwargs)
+as_of_date_2_picker = widgets.DatePicker(value=as_of_date_2, **kwargs)
+as_of_date_3_picker = widgets.DatePicker(value=as_of_date_3, **kwargs)
+
+chart_container = widgets.HBox()
+
+spinner = widgets.HTML(
+   """<i class="fa fa-spinner fa-spin" style="font-size: 18px"></i>""",
+   layout={
+       "visibility": "hidden", 
+       "margin": "10px 0 0 10px", 
+       "width": "40px"
+   },
+)
+
+exception = widgets.HTML(layout={'width': '800px', 'margin': '8px 0 0 0'})
+
+run_button = widgets.Button(
+    description='Run', 
+    style={'description_width': 'initial'}, 
+    layout={'width': 'auto', 'margin': '10px 0 0 0'},
+    button_style='success'
+)
+
+def update_model_options(event):
+    """
+    Handler to update the model dropdown with the model options available
+    for the chosen country.
+    """
+    model_options = get_country_model(event['new'])
+    model_dropdown.options = model_options
+    
+# Register the listener function
+country_dropdown.observe(update_model_options, names='label')
+
+def run(event=None):
+    """
+    Requests data and constructs a line chart showing the evolution of
+    the implied rate over the required range, and based on the desired
+    as of dates."""
+    
+    spinner.layout.visibility = 'visible'
+    chart_container.children = []
+    exception.value = ''
+
+    try:
+        as_of_dates = [
+            as_of_date_1_picker.value,
+            as_of_date_2_picker.value,
+            as_of_date_3_picker.value
+        ]
+        
+        df = get_data_all_as_of_dates(
+            country_dropdown.value, 
+            model_dropdown.value, 
+            meeting_start_picker.value, 
+            meeting_end_picker.value, 
+            as_of_dates
+        )
+        
+        effective_rate_df = get_effective_rate(
+            country_dropdown.value, 
+            model_dropdown.value, 
+            meeting_start_picker.value, 
+        )
+        
+        fig = build_subplot(df, effective_rate_df, as_of_dates)
+        chart_container.children = [fig]
+
+    except Exception as e:
+        exception.value = f'<p style="word-wrap: break-word;">Error: {e}</p>'
+    
+    finally:
+        spinner.layout.visibility = 'hidden'
+
+# Register the listener function
+run_button.on_click(run)
+
+# Collect display widgets together
+controls = widgets.VBox([
+    widgets.HBox([country_dropdown, model_dropdown]),
+    widgets.HBox([
+        widgets.Label('Meeting Date Range:'), 
+        meeting_start_picker, 
+        meeting_end_picker,
+        widgets.Label('As of Dates:'), 
+        as_of_date_1_picker, 
+        as_of_date_2_picker, 
+        as_of_date_3_picker
+    ]), 
+    widgets.HBox([run_button, spinner, exception])
+])
+
+ui_display = widgets.VBox(
+    [controls, chart_container], 
+    layout={'min_width': 'max-content'}
+)
+
+# Run on startup
+run()
+ui_display
+
+<span style="color: gray; font-size: 0.8em; font-style: italic; line-height: 2.25">
+    <hr>
+        While the content, sample projects and code examples available on the BQuant Help Center ("Content") have been reviewed by Bloomberg for reliability and, where relevant, conformance to current market practices, Bloomberg does not guarantee their correctness or completeness and reserves the right to update them from time to time. The Content is made available for illustration purposes only. Customers are solely responsible for the selection of and the use or intended use of the Content, and for verifying their accuracy and adequacy, the resultant output thereof and the assumptions and any other parameters when using such Content.<br>
+    <br>
+    BQuant services, including BQuant Desktop and BQuant Enterprise, do not express an opinion on the future or projected value of any security and are not research recommendations (i.e., recommendations as to whether or not to “buy”, “sell”, “hold”, or to enter or not to enter into any other transaction involving any specific interest) or a recommendation as to an investment or other strategy.  No aspect of the BQuant services is based on the consideration of a customer’s individual circumstances and information available via the BQuant services should not be considered as information sufficient upon which to base an investment decision.  Customers and their users should determine on their own whether they agree with any code, parameters, inputs, models, formulas and data.  BQuant services should not be construed as tax, accounting, legal or regulatory advice or opinions, or sufficient to satisfy any tax, accounting, legal or regulatory requirements. Customers and their users are solely responsible for the selection of and use of appropriate parameters, inputs, models, formulas and data for meeting their tax, accounting, legal or regulatory requirements.
+</span>
