@@ -1,0 +1,2325 @@
+# =========================
+# IMPORTS
+# =========================
+import bql
+import pandas as pd
+import numpy as np
+import datetime as dt
+import ipywidgets as widgets
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from IPython.display import display, clear_output
+
+bq = bql.Service()
+
+# =========================
+# BASE HELPERS
+# =========================
+def safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _flatten_bql_df(response_item):
+    df = response_item.df().copy()
+    df = df.reset_index()
+
+    possible_id_cols = ["ID", "index", "security", "Security"]
+    id_col = None
+
+    for col in possible_id_cols:
+        if col in df.columns:
+            id_col = col
+            break
+
+    if id_col is None:
+        id_col = df.columns[0]
+
+    df = df.rename(columns={id_col: "ID"})
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
+
+def _find_col(df, candidates):
+    lower_map = {str(c).lower(): c for c in df.columns}
+
+    for candidate in candidates:
+        if candidate.lower() in lower_map:
+            return lower_map[candidate.lower()]
+
+    for col in df.columns:
+        col_lower = str(col).lower()
+        for candidate in candidates:
+            if candidate.lower() in col_lower:
+                return col
+
+    return None
+
+
+def _first_numeric_col(df, exclude_cols=None):
+    if exclude_cols is None:
+        exclude_cols = []
+
+    exclude_set = set([str(x).lower() for x in exclude_cols])
+
+    for col in df.columns:
+        if str(col).lower() in exclude_set:
+            continue
+
+        s = pd.to_numeric(df[col], errors="coerce")
+
+        if s.notna().any():
+            return col
+
+    return None
+
+
+def to_date(x):
+    if isinstance(x, pd.Timestamp):
+        return x.date()
+    if isinstance(x, dt.datetime):
+        return x.date()
+    return x
+
+
+def actual_days(start, end):
+    start = to_date(start)
+    end = to_date(end)
+    return (end - start).days
+
+
+def daily_log_from_annual_pct(rate_pct, basis=360):
+    if pd.isna(rate_pct):
+        return np.nan
+
+    r = rate_pct / 100.0
+    daily_factor = 1.0 + r / float(basis)
+
+    if daily_factor <= 0:
+        return np.nan
+
+    return np.log(daily_factor)
+
+
+def annual_pct_from_daily_log(daily_log_rate, basis=360):
+    if pd.isna(daily_log_rate):
+        return np.nan
+
+    daily_simple = np.expm1(daily_log_rate)
+    annual_decimal = daily_simple * float(basis)
+    return annual_decimal * 100.0
+
+
+def instrument_log_factor_from_annual_pct(rate_pct, tenor_days, basis=360):
+    if pd.isna(rate_pct) or tenor_days <= 0:
+        return np.nan
+
+    r = rate_pct / 100.0
+    T = tenor_days / float(basis)
+
+    factor = 1.0 + r * T
+
+    if factor <= 0:
+        return np.nan
+
+    return np.log(factor)
+
+
+def annual_pct_from_instrument_log_factor(log_factor, tenor_days, basis=360):
+    if pd.isna(log_factor) or tenor_days <= 0:
+        return np.nan
+
+    T = tenor_days / float(basis)
+    factor = np.exp(log_factor)
+
+    annual_decimal = (factor - 1.0) / T
+    return annual_decimal * 100.0
+
+
+def get_chart_end_date(meeting_table, model_meetings_df=None, curve_df=None, buffer_days=30):
+    candidates = []
+
+    if meeting_table is not None and not meeting_table.empty:
+        if "Segment End" in meeting_table.columns:
+            candidates.extend([to_date(x) for x in meeting_table["Segment End"].dropna().tolist()])
+        if "Effective Date" in meeting_table.columns:
+            candidates.extend([to_date(x) for x in meeting_table["Effective Date"].dropna().tolist()])
+        if "Meeting" in meeting_table.columns:
+            candidates.extend([to_date(x) for x in meeting_table["Meeting"].dropna().tolist()])
+
+    if len(candidates) == 0 and model_meetings_df is not None and not model_meetings_df.empty:
+        if "Effective Date" in model_meetings_df.columns:
+            candidates.extend([to_date(x) for x in model_meetings_df["Effective Date"].dropna().tolist()])
+
+    if len(candidates) == 0 and curve_df is not None and not curve_df.empty:
+        candidates.extend([x.date() for x in pd.to_datetime(curve_df["maturity"]).dropna().tolist()])
+
+    if len(candidates) == 0:
+        return dt.date.today() + dt.timedelta(days=365)
+
+    return max(candidates) + dt.timedelta(days=int(buffer_days))
+
+
+def render_dataframe_html(df, max_height_px=None):
+    if df is None or df.empty:
+        return widgets.HTML("<i>No data available.</i>")
+
+    html = df.to_html(index=True, escape=False)
+
+    max_height_style = ""
+    if max_height_px is not None:
+        max_height_style = f"max-height:{int(max_height_px)}px; overflow-y:auto;"
+
+    styled_html = f"""
+    <div style="
+        overflow-x:auto;
+        {max_height_style}
+        width:100%;
+        max-width:1500px;
+        border:1px solid #333;
+    ">
+        <style>
+            table {{
+                border-collapse: collapse;
+                font-family: Arial, sans-serif;
+                font-size: 13px;
+                white-space: normal;
+                width: auto;
+                min-width: 900px;
+            }}
+            th {{
+                background-color: #222;
+                color: #f5f5f5;
+                padding: 6px 8px;
+                border-bottom: 1px solid #555;
+                text-align: left;
+                white-space: nowrap;
+            }}
+            td {{
+                padding: 6px 8px;
+                border-bottom: 1px solid #333;
+                vertical-align: top;
+                max-width: 700px;
+                word-wrap: break-word;
+            }}
+            tr:nth-child(even) {{
+                background-color: #1e1e1e;
+            }}
+            tr:nth-child(odd) {{
+                background-color: #111;
+            }}
+        </style>
+        {html}
+    </div>
+    """
+
+    return widgets.HTML(styled_html)
+
+
+def date_to_ordinal(d):
+    d = to_date(d)
+    return pd.Timestamp(d).toordinal()
+
+
+def ordinal_to_timestamp(x):
+    return pd.Timestamp.fromordinal(int(round(float(x))))
+
+
+def smooth_curve_points(curve_plot_df, valuation_date, max_points=250):
+    df = curve_plot_df.copy()
+    df = df.dropna(subset=["maturity", "rate"])
+    df = df.sort_values("maturity")
+
+    if df.empty:
+        return pd.DataFrame(columns=["date", "rate"])
+
+    x_nodes = np.array(
+        [date_to_ordinal(x.date()) for x in pd.to_datetime(df["maturity"])],
+        dtype=float
+    )
+    y_nodes = np.array(df["rate"], dtype=float)
+
+    unique_mask = np.concatenate([[True], np.diff(x_nodes) > 0])
+    x_nodes = x_nodes[unique_mask]
+    y_nodes = y_nodes[unique_mask]
+
+    if len(x_nodes) == 1:
+        return pd.DataFrame({
+            "date": [ordinal_to_timestamp(x_nodes[0])],
+            "rate": [y_nodes[0]]
+        })
+
+    x_grid = np.linspace(x_nodes.min(), x_nodes.max(), max_points)
+
+    try:
+        from scipy.interpolate import PchipInterpolator
+        interpolator = PchipInterpolator(x_nodes, y_nodes)
+        y_grid = interpolator(x_grid)
+    except Exception:
+        y_grid = np.interp(x_grid, x_nodes, y_nodes)
+
+    return pd.DataFrame({
+        "date": [ordinal_to_timestamp(x) for x in x_grid],
+        "rate": y_grid
+    })
+# =========================
+# CONFIG
+# =========================
+# Plain TIIE removed. Only TIIE RFR is valid for this model.
+CURVE_MAP = {
+    "MXN_TIIE_RFR": "YCSW0583 Index"
+}
+
+COUNTRY_MAP = {
+    "Mexico": {
+        "country_universe": "MX Country",
+        "overnight_rate_ticker": "MXONBR Index",
+        "rate_decision_ticker_root": "MXONBR",
+        "include_event_keywords": [
+            "overnight rate",
+            "rate decision",
+            "policy rate",
+            "target rate"
+        ],
+        "exclude_event_keywords": [
+            "minutes",
+            "speech",
+            "conference",
+            "forecast",
+            "report"
+        ],
+        "fallback_meeting_gap_days": 42
+    }
+}
+
+INTERPOLATION_METHODS = [
+    "Linear",
+    "Exponential",
+    "Front-loaded",
+    "Back-loaded",
+    "Smoothstep",
+    "Jump then flat",
+    "Flat then jump"
+]
+CURVE_SIDES = ["MID", "BID", "ASK"]
+
+DEFAULT_MODEL_CONFIG = {
+    "basis": 360,
+    "step_size_pct": 0.25,
+    "min_unknown_days": 7,
+    "effective_lag_days": 0,
+    "boundary_lookahead_days": 800,
+    "interpolation_method": "Linear",
+    "interpolation_shape": 2.0,
+    "min_days_to_next_tenor": 10,
+    "curve_side": "MID"
+}
+# =========================
+# HELPERS
+# =========================
+def no_change_zero_rate_to_date(
+    valuation_date,
+    maturity_date,
+    current_on_rate_pct,
+    basis=360
+):
+    """
+    Returns the market-equivalent zero/average rate if the current O/N rate
+    stays unchanged until maturity.
+
+    This is the correct benchmark for deciding whether the curve implies
+    hikes or cuts.
+    """
+    valuation_date = to_date(valuation_date)
+    maturity_date = to_date(maturity_date)
+
+    tenor_days = actual_days(valuation_date, maturity_date)
+
+    if tenor_days <= 0:
+        return current_on_rate_pct
+
+    current_daily_log = daily_log_from_annual_pct(
+        current_on_rate_pct,
+        basis=basis
+    )
+
+    if not np.isfinite(current_daily_log):
+        return np.nan
+
+    log_factor = current_daily_log * tenor_days
+
+    return annual_pct_from_instrument_log_factor(
+        log_factor=log_factor,
+        tenor_days=tenor_days,
+        basis=basis
+    )
+    
+def model_log_factor_to_date(
+    valuation_date,
+    maturity_date,
+    current_on_rate_pct,
+    meeting_table,
+    basis=360
+):
+    """
+    Returns the model-implied log accumulation factor from valuation_date to maturity_date
+    using the already-solved meeting path.
+
+    This is more primitive than a rebuilt zero rate.
+    The rebuilt zero rate is derived from this log factor.
+    """
+    valuation_date = to_date(valuation_date)
+    maturity_date = to_date(maturity_date)
+
+    tenor_days = actual_days(valuation_date, maturity_date)
+
+    if tenor_days <= 0:
+        return 0.0
+
+    if meeting_table is None or len(meeting_table) == 0:
+        mtg = pd.DataFrame()
+    else:
+        mtg = meeting_table.copy()
+        mtg["Effective Date"] = mtg["Effective Date"].apply(to_date)
+        mtg = mtg[
+            (mtg["Effective Date"] > valuation_date) &
+            (mtg["Effective Date"] < maturity_date)
+        ].copy()
+        mtg = mtg.sort_values("Effective Date")
+
+    log_factor = 0.0
+    seg_start = valuation_date
+    seg_rate = float(current_on_rate_pct)
+
+    for _, row in mtg.iterrows():
+        eff_date = row["Effective Date"]
+        post_rate = float(row["Post-Meeting O/N (%)"])
+
+        days = actual_days(seg_start, eff_date)
+
+        if days > 0:
+            daily_log = daily_log_from_annual_pct(seg_rate, basis=basis)
+
+            if not np.isfinite(daily_log):
+                return np.nan
+
+            log_factor += daily_log * days
+
+        seg_start = eff_date
+        seg_rate = post_rate
+
+    final_days = actual_days(seg_start, maturity_date)
+
+    if final_days > 0:
+        daily_log = daily_log_from_annual_pct(seg_rate, basis=basis)
+
+        if not np.isfinite(daily_log):
+            return np.nan
+
+        log_factor += daily_log * final_days
+
+    return log_factor
+
+
+
+def model_zero_rate_to_date(
+    valuation_date,
+    maturity_date,
+    current_on_rate_pct,
+    meeting_table,
+    basis=360
+):
+    """
+    Rebuilds the zero/average rate from valuation_date to maturity_date
+    using the implied post-meeting O/N step path.
+
+    This is the line that should match the TIIE RFR curve.
+    """
+    valuation_date = to_date(valuation_date)
+    maturity_date = to_date(maturity_date)
+
+    tenor_days = actual_days(valuation_date, maturity_date)
+
+    if tenor_days <= 0:
+        return current_on_rate_pct
+
+    mtg = meeting_table.copy()
+
+    if not mtg.empty:
+        mtg["Effective Date"] = mtg["Effective Date"].apply(to_date)
+        mtg = mtg[
+            (mtg["Effective Date"] > valuation_date) &
+            (mtg["Effective Date"] < maturity_date)
+        ].copy()
+        mtg = mtg.sort_values("Effective Date")
+
+    segments = []
+    seg_start = valuation_date
+    seg_rate = float(current_on_rate_pct)
+
+    for _, row in mtg.iterrows():
+        eff_date = row["Effective Date"]
+        post_rate = float(row["Post-Meeting O/N (%)"])
+
+        days = actual_days(seg_start, eff_date)
+
+        if days > 0:
+            segments.append((days, seg_rate))
+
+        seg_start = eff_date
+        seg_rate = post_rate
+
+    final_days = actual_days(seg_start, maturity_date)
+
+    if final_days > 0:
+        segments.append((final_days, seg_rate))
+
+    log_factor = 0.0
+
+    for days, rate in segments:
+        daily_log = daily_log_from_annual_pct(rate, basis=basis)
+
+        if not np.isfinite(daily_log):
+            return np.nan
+
+        log_factor += daily_log * days
+
+    return annual_pct_from_instrument_log_factor(
+        log_factor=log_factor,
+        tenor_days=tenor_days,
+        basis=basis
+    )
+
+
+def build_curve_plot_nodes_with_on_anchor(curve_df, current_on_rate, chart_end_date):
+    """
+    Builds curve nodes for charting and adds the current O/N rate as the starting point.
+    This is for plotting only.
+    """
+    valuation_date = curve_df.attrs.get("valuation_date", dt.date.today())
+    valuation_date = to_date(valuation_date)
+    chart_end_date = to_date(chart_end_date)
+
+    curve_plot_df = curve_df.copy()
+    curve_plot_df["maturity_date"] = pd.to_datetime(curve_plot_df["maturity"]).dt.date
+
+    curve_plot_df = curve_plot_df[
+        (curve_plot_df["maturity_date"] >= valuation_date) &
+        (curve_plot_df["maturity_date"] <= chart_end_date)
+    ].copy()
+
+    on_anchor = pd.DataFrame({
+        "ID": ["Current O/N"],
+        "maturity": [pd.Timestamp(valuation_date)],
+        "maturity_date": [valuation_date],
+        "rate": [float(current_on_rate)]
+    })
+
+    keep_cols = ["ID", "maturity", "maturity_date", "rate"]
+
+    curve_plot_df = curve_plot_df[[c for c in keep_cols if c in curve_plot_df.columns]].copy()
+    curve_plot_df = pd.concat([on_anchor, curve_plot_df], ignore_index=True)
+
+    curve_plot_df = curve_plot_df.dropna(subset=["maturity", "rate"])
+    curve_plot_df = curve_plot_df.sort_values("maturity")
+    curve_plot_df = curve_plot_df.drop_duplicates(subset=["maturity"], keep="first")
+    curve_plot_df = curve_plot_df.reset_index(drop=True)
+
+    return curve_plot_df
+
+# =========================
+# CURRENT O/N RATE
+# =========================
+def get_current_overnight_rate(country_name, verbose=False):
+    cfg = COUNTRY_MAP[country_name]
+    ticker = cfg["overnight_rate_ticker"]
+
+    request = bql.Request(
+        ticker,
+        {"PX_LAST": bq.data.px_last()}
+    )
+
+    response = bq.execute(request)
+    df = _flatten_bql_df(response[0])
+
+    if verbose:
+        display(df)
+
+    value_col = _find_col(df, ["PX_LAST", "px_last", "LAST_PRICE", "value"])
+
+    if value_col is None:
+        value_col = _first_numeric_col(df, exclude_cols=["ID"])
+
+    if value_col is None:
+        raise ValueError(f"Could not find numeric O/N rate column. Columns: {list(df.columns)}")
+
+    rate = pd.to_numeric(df[value_col], errors="coerce").dropna()
+
+    if rate.empty:
+        raise ValueError(f"No valid O/N rate returned for {ticker}.")
+
+    return float(rate.iloc[0]), ticker
+
+
+# =========================
+# CURVE DATA
+# =========================
+def get_curve_data(curve_name, curve_side="MID", verbose=False):
+    if curve_name not in CURVE_MAP:
+        raise ValueError(
+            f"Unknown curve name: {curve_name}. "
+            f"Valid curve choices are: {list(CURVE_MAP.keys())}"
+        )
+
+    curve_side = str(curve_side).upper()
+
+    if curve_side not in ["MID", "BID", "ASK"]:
+        raise ValueError("curve_side must be one of: MID, BID, ASK")
+
+    curve_ticker = CURVE_MAP[curve_name]
+    universe = bq.univ.curvemembers(symbols=curve_ticker)
+
+    request = bql.Request(
+        universe,
+        {"Curve Rate": bq.data.curve_rate(side=curve_side)}
+    )
+
+    response = bq.execute(request)
+    members_df = _flatten_bql_df(response[0])
+
+    if verbose:
+        display(members_df.head(40))
+
+    rate_col = _find_col(members_df, ["Curve Rate", "curve_rate", "rate"])
+    date_col = _find_col(members_df, ["DATE", "date"])
+
+    if rate_col is None:
+        raise ValueError(f"Could not find Curve Rate column. Columns: {list(members_df.columns)}")
+
+    keep_cols = ["ID", rate_col]
+
+    if date_col is not None:
+        keep_cols.append(date_col)
+
+    members_df = members_df[keep_cols].copy()
+    members_df = members_df.rename(columns={rate_col: "rate"})
+
+    if date_col is not None:
+        members_df = members_df.rename(columns={date_col: "curve_date"})
+    else:
+        members_df["curve_date"] = pd.Timestamp(dt.date.today())
+
+    members_df["rate"] = pd.to_numeric(members_df["rate"], errors="coerce")
+    members_df["curve_date"] = pd.to_datetime(members_df["curve_date"], errors="coerce")
+
+    members_df = members_df.dropna(subset=["ID", "rate"])
+    members_df = members_df[(members_df["rate"] > -50) & (members_df["rate"] < 100)]
+
+    if members_df.empty:
+        raise ValueError("No valid curve members/rates returned.")
+
+    front_rate_anchor = float(members_df["rate"].iloc[0])
+
+    if members_df["curve_date"].notna().any():
+        valuation_date = members_df["curve_date"].dropna().iloc[0].date()
+    else:
+        valuation_date = dt.date.today()
+
+    ids = members_df["ID"].dropna().astype(str).unique().tolist()
+
+    maturity_request = bql.Request(
+        ids,
+        {"Maturity": bq.data.maturity()}
+    )
+
+    maturity_response = bq.execute(maturity_request)
+    maturity_df = _flatten_bql_df(maturity_response[0])
+
+    maturity_col = _find_col(maturity_df, ["Maturity", "maturity"])
+
+    if maturity_col is None:
+        raise ValueError(f"Could not find Maturity column. Columns: {list(maturity_df.columns)}")
+
+    maturity_df = maturity_df[["ID", maturity_col]].copy()
+    maturity_df = maturity_df.rename(columns={maturity_col: "maturity"})
+    maturity_df["maturity"] = pd.to_datetime(maturity_df["maturity"], errors="coerce")
+
+    curve_df = pd.merge(
+        members_df,
+        maturity_df,
+        on="ID",
+        how="left"
+    )
+
+    curve_df = curve_df.dropna(subset=["maturity", "rate"]).copy()
+    curve_df["valuation_date"] = pd.Timestamp(valuation_date)
+
+    curve_df["days_to_maturity"] = curve_df["maturity"].apply(
+        lambda x: actual_days(valuation_date, x.date())
+    )
+
+    curve_df = curve_df[curve_df["days_to_maturity"] > 0].copy()
+
+    curve_df["T_360"] = curve_df["days_to_maturity"] / 360.0
+    curve_df["T_365"] = curve_df["days_to_maturity"] / 365.0
+
+    curve_df = curve_df.sort_values("maturity")
+    curve_df = curve_df.drop_duplicates(subset=["maturity"], keep="first")
+    curve_df = curve_df.reset_index(drop=True)
+
+    if curve_df.empty:
+        raise ValueError("Curve dataframe is empty after maturity filtering.")
+
+    curve_df.attrs["valuation_date"] = valuation_date
+    curve_df.attrs["front_rate_anchor"] = front_rate_anchor
+    curve_df.attrs["curve_ticker"] = curve_ticker
+    curve_df.attrs["curve_name"] = curve_name
+    curve_df.attrs["curve_side"] = curve_side
+
+    return curve_df
+# =========================
+# CENTRAL BANK CALENDAR
+# =========================
+def get_central_bank_meetings_bql(country_name, start, end, verbose=False):
+    cfg = COUNTRY_MAP[country_name]
+    universe = cfg["country_universe"]
+
+    include_keywords = [x.lower() for x in cfg["include_event_keywords"]]
+    exclude_keywords = [x.lower() for x in cfg["exclude_event_keywords"]]
+    ticker_root = cfg["rate_decision_ticker_root"].lower()
+
+    start = to_date(start)
+    end = to_date(end)
+
+    data_item = bq.data.calendar(
+        type="CENTRAL_BANKS",
+        subtype="ALL_CENTRAL_BANKS",
+        dates=bq.func.range(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+        view="EXTENDED"
+    )
+
+    request = bql.Request(universe, data_item)
+    response = bq.execute(request)
+
+    cal_df = _flatten_bql_df(response[0])
+
+    if verbose:
+        display(cal_df)
+
+    if cal_df.empty:
+        raise ValueError("BQL central bank calendar returned no rows.")
+
+    release_date_col = _find_col(
+        cal_df,
+        ["RELEASE_DATE", "release_date", "Release Date", "RELEASE_DATE_TIME", "release_date_time"]
+    )
+
+    event_name_col = _find_col(
+        cal_df,
+        ["EVENT_NAME", "event_name", "Event Name"]
+    )
+
+    release_time_col = _find_col(
+        cal_df,
+        ["RELEASE_TIME", "release_time", "Release Time"]
+    )
+
+    value_col = _find_col(
+        cal_df,
+        ["VALUE", "value", "calendar"]
+    )
+
+    if release_date_col is None:
+        raise ValueError(f"Could not find release date column. Columns: {list(cal_df.columns)}")
+
+    if event_name_col is None:
+        raise ValueError(f"Could not find event name column. Columns: {list(cal_df.columns)}")
+
+    df = cal_df.copy()
+
+    df["Meeting Date"] = pd.to_datetime(df[release_date_col], errors="coerce").dt.date
+    df["Event Name"] = df[event_name_col].astype(str)
+
+    if release_time_col is not None:
+        df["Release Time"] = df[release_time_col].astype(str)
+    else:
+        df["Release Time"] = ""
+
+    if value_col is not None:
+        df["Ticker"] = df[value_col].astype(str)
+    else:
+        df["Ticker"] = ""
+
+    df = df.dropna(subset=["Meeting Date"]).copy()
+
+    event_lower = df["Event Name"].str.lower()
+    ticker_lower = df["Ticker"].str.lower()
+
+    include_mask = (
+        event_lower.apply(lambda x: any(k in x for k in include_keywords)) |
+        ticker_lower.str.contains(ticker_root, na=False)
+    )
+
+    exclude_mask = event_lower.apply(lambda x: any(k in x for k in exclude_keywords))
+
+    df = df[include_mask & ~exclude_mask].copy()
+
+    if df.empty:
+        raise ValueError(
+            "No rate-decision events found after filtering calendar. "
+            "Check event keywords/ticker mapping."
+        )
+
+    grouped = (
+        df.groupby("Meeting Date")
+        .agg({
+            "Event Name": lambda x: " | ".join(sorted(set([str(v) for v in x]))),
+            "Release Time": lambda x: " | ".join(sorted(set([str(v) for v in x if str(v) != "nan"]))),
+            "Ticker": lambda x: " | ".join(sorted(set([str(v) for v in x if str(v) != "nan"])))
+        })
+        .reset_index()
+    )
+
+    grouped["Type"] = "BQL Central Bank Calendar"
+    grouped = grouped.sort_values("Meeting Date").reset_index(drop=True)
+
+    return grouped
+
+
+def estimate_next_boundary_date(requested_df, country_name):
+    cfg = COUNTRY_MAP[country_name]
+    fallback_gap = int(cfg.get("fallback_meeting_gap_days", 42))
+
+    dates = requested_df["Meeting Date"].sort_values().tolist()
+
+    if len(dates) >= 2:
+        gaps = [
+            actual_days(dates[i], dates[i + 1])
+            for i in range(len(dates) - 1)
+        ]
+
+        gaps = [g for g in gaps if g > 10]
+
+        if len(gaps) > 0:
+            gap = int(round(np.median(gaps)))
+        else:
+            gap = fallback_gap
+    else:
+        gap = fallback_gap
+
+    return dates[-1] + dt.timedelta(days=gap)
+
+
+def build_meeting_calendar_for_model(
+    country_name,
+    effective_lag_days=0,
+    boundary_lookahead_days=800
+):
+    today = dt.date.today()
+    year_end = dt.date(today.year, 12, 31)
+    pull_end = year_end + dt.timedelta(days=int(boundary_lookahead_days))
+
+    meetings_df = get_central_bank_meetings_bql(
+        country_name=country_name,
+        start=today,
+        end=pull_end,
+        verbose=False
+    )
+
+    meetings_df["Meeting Date"] = meetings_df["Meeting Date"].apply(to_date)
+    meetings_df = meetings_df[meetings_df["Meeting Date"] >= today].copy()
+    meetings_df = meetings_df.sort_values("Meeting Date").reset_index(drop=True)
+
+    requested_df = meetings_df[meetings_df["Meeting Date"] <= year_end].copy()
+    boundary_candidates = meetings_df[meetings_df["Meeting Date"] > year_end].copy()
+
+    if requested_df.empty:
+        raise ValueError(f"No future rate-decision meetings found through year-end {year_end}.")
+
+    requested_df["Requested"] = True
+    requested_df["Boundary Only"] = False
+    requested_df["Boundary Source"] = ""
+
+    if not boundary_candidates.empty:
+        boundary_df = boundary_candidates.iloc[[0]].copy()
+        boundary_df["Boundary Source"] = "BQL next rate decision"
+    else:
+        estimated_boundary_date = estimate_next_boundary_date(requested_df, country_name)
+
+        boundary_df = pd.DataFrame({
+            "Meeting Date": [estimated_boundary_date],
+            "Event Name": ["Estimated boundary only"],
+            "Release Time": [""],
+            "Ticker": [""],
+            "Type": ["Estimated Boundary"],
+            "Boundary Source": ["Estimated from recent meeting cadence"]
+        })
+
+    boundary_df["Requested"] = False
+    boundary_df["Boundary Only"] = True
+
+    model_df = pd.concat([requested_df, boundary_df], ignore_index=True)
+    model_df = model_df.sort_values("Meeting Date").reset_index(drop=True)
+
+    model_df["Effective Date"] = model_df["Meeting Date"].apply(
+        lambda x: x + dt.timedelta(days=int(effective_lag_days))
+    )
+
+    return model_df, today, year_end
+
+
+# =========================
+# INTERPOLATION ENGINE
+# =========================
+def interpolation_weight(t, method="Linear", shape=2.0):
+    """
+    Returns the fraction of the total start-to-end TPM change realized at normalized time t.
+    t is clipped to [0, 1].
+    """
+    if pd.isna(t):
+        return np.nan
+
+    t = max(0.0, min(1.0, float(t)))
+    method = str(method)
+
+    shape = safe_float(shape, 2.0)
+
+    if not np.isfinite(shape) or shape <= 0:
+        shape = 2.0
+
+    if method == "Linear":
+        return t
+
+    if method == "Front-loaded":
+        return 1.0 - (1.0 - t) ** shape
+
+    if method == "Back-loaded":
+        return t ** shape
+
+    if method == "Smoothstep":
+        return 3.0 * t ** 2 - 2.0 * t ** 3
+
+    if method == "Jump then flat":
+        return 1.0 if t > 0 else 0.0
+
+    if method == "Flat then jump":
+        return 0.0 if t < 1.0 else 1.0
+
+    return t
+
+
+def interpolated_level(start_rate, end_rate, t, method="Linear", shape=2.0):
+    """
+    Interpolates a policy-rate level between start_rate and end_rate.
+
+    Exponential interpolation is multiplicative:
+        start * (end / start) ** t
+
+    For non-positive rates, exponential falls back to linear because log/multiplicative
+    interpolation is not well-defined.
+    """
+    start_rate = float(start_rate)
+    end_rate = float(end_rate)
+
+    t = max(0.0, min(1.0, float(t)))
+    method = str(method)
+
+    if method == "Exponential":
+        if start_rate > 0 and end_rate > 0:
+            return start_rate * (end_rate / start_rate) ** t
+        else:
+            w = t
+            return start_rate + w * (end_rate - start_rate)
+
+    w = interpolation_weight(t, method=method, shape=shape)
+    return start_rate + w * (end_rate - start_rate)
+
+
+def interval_avg_daily_log_from_meeting_rates(
+    interval_start,
+    interval_end,
+    start_rate_pct,
+    meeting_dates,
+    meeting_post_rates,
+    basis=360
+):
+    """
+    Calculates average daily log rate across one curve interval.
+
+    Policy is piecewise constant:
+    - start_rate applies from interval_start to first meeting.
+    - each meeting_post_rate applies from its meeting date to the next meeting / interval end.
+    """
+    interval_start = to_date(interval_start)
+    interval_end = to_date(interval_end)
+
+    total_days = actual_days(interval_start, interval_end)
+
+    if total_days <= 0:
+        return np.nan
+
+    meeting_pairs = []
+
+    for d, r in zip(meeting_dates, meeting_post_rates):
+        d = to_date(d)
+
+        if interval_start < d < interval_end:
+            meeting_pairs.append((d, float(r)))
+
+    meeting_pairs = sorted(meeting_pairs, key=lambda x: x[0])
+
+    segments = []
+    seg_start = interval_start
+    seg_rate = float(start_rate_pct)
+
+    for meeting_date, post_rate in meeting_pairs:
+        days = actual_days(seg_start, meeting_date)
+
+        if days > 0:
+            segments.append((days, seg_rate))
+
+        seg_start = meeting_date
+        seg_rate = post_rate
+
+    final_days = actual_days(seg_start, interval_end)
+
+    if final_days > 0:
+        segments.append((final_days, seg_rate))
+
+    log_sum = 0.0
+
+    for days, rate in segments:
+        dl = daily_log_from_annual_pct(rate, basis=basis)
+
+        if not np.isfinite(dl):
+            return np.nan
+
+        log_sum += dl * days
+
+    return log_sum / total_days
+
+
+def solve_scalar_bisection(func, x0, lower=None, upper=None, max_iter=100, tol=1e-12):
+    """
+    Simple robust scalar solver for monotonic-ish functions.
+    Expands brackets around x0 if needed.
+    """
+    x0 = float(x0)
+
+    if lower is None or upper is None:
+        width = 1.0
+
+        if np.isfinite(x0):
+            center = x0
+        else:
+            center = 0.0
+
+        lower = center - width
+        upper = center + width
+
+        f_lower = func(lower)
+        f_upper = func(upper)
+
+        expand_count = 0
+
+        while np.isfinite(f_lower) and np.isfinite(f_upper) and f_lower * f_upper > 0 and expand_count < 60:
+            width *= 2.0
+            lower = center - width
+            upper = center + width
+            f_lower = func(lower)
+            f_upper = func(upper)
+            expand_count += 1
+    else:
+        lower = float(lower)
+        upper = float(upper)
+        f_lower = func(lower)
+        f_upper = func(upper)
+
+    f_lower = func(lower)
+    f_upper = func(upper)
+
+    if not np.isfinite(f_lower) or not np.isfinite(f_upper):
+        raise ValueError("Scalar solver encountered non-finite bracket values.")
+
+    if abs(f_lower) < tol:
+        return lower
+
+    if abs(f_upper) < tol:
+        return upper
+
+    if f_lower * f_upper > 0:
+        # Fallback to a local secant-ish grid search if bracketing fails.
+        grid = np.linspace(lower, upper, 2001)
+        vals = np.array([func(x) for x in grid], dtype=float)
+        valid = np.isfinite(vals)
+
+        if not valid.any():
+            raise ValueError("Scalar solver could not find any finite function values.")
+
+        idx = np.nanargmin(np.abs(vals))
+        return float(grid[idx])
+
+    for _ in range(max_iter):
+        mid = 0.5 * (lower + upper)
+        f_mid = func(mid)
+
+        if not np.isfinite(f_mid):
+            raise ValueError("Scalar solver encountered non-finite midpoint value.")
+
+        if abs(f_mid) < tol:
+            return mid
+
+        if f_lower * f_mid <= 0:
+            upper = mid
+            f_upper = f_mid
+        else:
+            lower = mid
+            f_lower = f_mid
+
+    return 0.5 * (lower + upper)
+
+
+def solve_single_meeting_rate_for_interval(
+    interval_start,
+    interval_end,
+    meeting_date,
+    start_rate_pct,
+    target_avg_daily_log,
+    basis=360
+):
+    """
+    Exact solve when there is exactly one meeting in a curve interval.
+    One instrument interval gives one equation and one unknown meeting post-rate.
+    """
+    interval_start = to_date(interval_start)
+    interval_end = to_date(interval_end)
+    meeting_date = to_date(meeting_date)
+
+    d0 = actual_days(interval_start, meeting_date)
+    d1 = actual_days(meeting_date, interval_end)
+    total_days = actual_days(interval_start, interval_end)
+
+    if total_days <= 0 or d1 <= 0:
+        return np.nan
+
+    start_daily_log = daily_log_from_annual_pct(start_rate_pct, basis=basis)
+
+    solved_daily_log = (
+        target_avg_daily_log * total_days - start_daily_log * d0
+    ) / d1
+
+    return annual_pct_from_daily_log(solved_daily_log, basis=basis)
+
+
+def solve_multi_meeting_rates_for_interval(
+    interval_start,
+    interval_end,
+    start_rate_pct,
+    meeting_dates,
+    target_avg_daily_log,
+    method="Linear",
+    shape=2.0,
+    basis=360
+):
+    """
+    Handles multiple meetings inside one curve interval.
+
+    The model solves for a latent terminal rate at the curve maturity such that
+    the piecewise-constant meeting path implied by the chosen interpolation method
+    matches the market-implied forward average rate for the interval.
+
+    Then each meeting rate is read off the interpolated path.
+    """
+    interval_start = to_date(interval_start)
+    interval_end = to_date(interval_end)
+
+    total_days = actual_days(interval_start, interval_end)
+
+    if total_days <= 0:
+        return [np.nan for _ in meeting_dates], np.nan
+
+    valid_meetings = [
+        to_date(d)
+        for d in meeting_dates
+        if interval_start < to_date(d) < interval_end
+    ]
+
+    valid_meetings = sorted(valid_meetings)
+
+    if len(valid_meetings) == 0:
+        return [], start_rate_pct
+
+    fwd_rate_guess = annual_pct_from_daily_log(target_avg_daily_log, basis=basis)
+
+    def meeting_rates_from_terminal(end_rate):
+        rates = []
+
+        for d in valid_meetings:
+            t = actual_days(interval_start, d) / float(total_days)
+            r = interpolated_level(
+                start_rate=start_rate_pct,
+                end_rate=end_rate,
+                t=t,
+                method=method,
+                shape=shape
+            )
+            rates.append(r)
+
+        return rates
+
+    def objective(end_rate):
+        rates = meeting_rates_from_terminal(end_rate)
+
+        avg_log = interval_avg_daily_log_from_meeting_rates(
+            interval_start=interval_start,
+            interval_end=interval_end,
+            start_rate_pct=start_rate_pct,
+            meeting_dates=valid_meetings,
+            meeting_post_rates=rates,
+            basis=basis
+        )
+
+        return avg_log - target_avg_daily_log
+
+    terminal_rate = solve_scalar_bisection(
+        func=objective,
+        x0=fwd_rate_guess
+    )
+
+    solved_rates = meeting_rates_from_terminal(terminal_rate)
+
+    return solved_rates, terminal_rate
+
+
+# =========================
+# INTERPOLATED MEETING SOLVER
+# =========================
+def build_forward_curve_intervals(df_curve, current_on_rate_pct, basis=360):
+    """
+    Converts zero-ish curve instruments into forward average daily-log intervals.
+
+    For instrument maturity T:
+        log_factor(0,T) is derived from the quoted instrument rate.
+
+    The forward interval from previous curve maturity to T is:
+        [log_factor(0,T) - log_factor(0,prev_T)] / days(prev_T,T)
+    """
+    valuation_date = df_curve.attrs.get("valuation_date", dt.date.today())
+    valuation_date = to_date(valuation_date)
+
+    curve_nodes = df_curve.copy().sort_values("maturity").reset_index(drop=True)
+
+    intervals = []
+
+    prev_date = valuation_date
+    prev_log_factor = 0.0
+    prev_maturity_days = 0
+
+    for _, inst in curve_nodes.iterrows():
+        inst_id = inst["ID"]
+        maturity_date = inst["maturity"].date()
+        inst_rate = float(inst["rate"])
+
+        tenor_days = actual_days(valuation_date, maturity_date)
+
+        if tenor_days <= 0:
+            continue
+
+        total_log_factor = instrument_log_factor_from_annual_pct(
+            rate_pct=inst_rate,
+            tenor_days=tenor_days,
+            basis=basis
+        )
+
+        if not np.isfinite(total_log_factor):
+            continue
+
+        interval_days = actual_days(prev_date, maturity_date)
+
+        if interval_days <= 0:
+            continue
+
+        forward_avg_daily_log = (total_log_factor - prev_log_factor) / interval_days
+        forward_avg_rate_pct = annual_pct_from_daily_log(forward_avg_daily_log, basis=basis)
+
+        intervals.append({
+            "Instrument": inst_id,
+            "Interval Start": prev_date,
+            "Interval End": maturity_date,
+            "Instrument Maturity": maturity_date,
+            "Instrument Rate (%)": inst_rate,
+            "Tenor Days": tenor_days,
+            "Interval Days": interval_days,
+            "Previous Maturity Days": prev_maturity_days,
+            "Total Log Factor": total_log_factor,
+            "Previous Log Factor": prev_log_factor,
+            "Forward Avg Daily Log": forward_avg_daily_log,
+            "Forward Avg Rate (%)": forward_avg_rate_pct
+        })
+
+        prev_date = maturity_date
+        prev_log_factor = total_log_factor
+        prev_maturity_days = tenor_days
+
+    intervals_df = pd.DataFrame(intervals)
+
+    if intervals_df.empty:
+        raise ValueError("Could not create forward curve intervals from curve data.")
+
+    return intervals_df, valuation_date
+
+
+def rate_path_avg_daily_log_to_maturity(
+    valuation_date,
+    maturity_date,
+    current_on_rate_pct,
+    meeting_table,
+    basis=360
+):
+    """
+    Rebuilds model-implied average daily log rate from valuation date to maturity
+    using the solved meeting path.
+    """
+    valuation_date = to_date(valuation_date)
+    maturity_date = to_date(maturity_date)
+
+    tenor_days = actual_days(valuation_date, maturity_date)
+
+    if tenor_days <= 0:
+        return np.nan
+
+    mtg = meeting_table.copy()
+
+    if not mtg.empty:
+        mtg["Effective Date"] = mtg["Effective Date"].apply(to_date)
+        mtg = mtg[
+            (mtg["Effective Date"] > valuation_date) &
+            (mtg["Effective Date"] < maturity_date)
+        ].copy()
+        mtg = mtg.sort_values("Effective Date")
+
+    segments = []
+    seg_start = valuation_date
+    seg_rate = float(current_on_rate_pct)
+
+    for _, row in mtg.iterrows():
+        eff_date = row["Effective Date"]
+        post_rate = float(row["Post-Meeting O/N (%)"])
+
+        days = actual_days(seg_start, eff_date)
+
+        if days > 0:
+            segments.append((days, seg_rate))
+
+        seg_start = eff_date
+        seg_rate = post_rate
+
+    final_days = actual_days(seg_start, maturity_date)
+
+    if final_days > 0:
+        segments.append((final_days, seg_rate))
+
+    log_sum = 0.0
+
+    for days, rate in segments:
+        dl = daily_log_from_annual_pct(rate, basis=basis)
+
+        if not np.isfinite(dl):
+            return np.nan
+
+        log_sum += dl * days
+
+    return log_sum / tenor_days
+
+
+def solve_meeting_levels_interpolated(
+    df_curve,
+    model_meetings_df,
+    current_on_rate_pct,
+    step_size_pct,
+    basis=360,
+    interpolation_method="Linear",
+    interpolation_shape=2.0,
+    min_unknown_days=7,
+    min_days_to_next_tenor=10
+):
+    """
+    Corrected solver.
+
+    Main idea:
+    - Do NOT solve only tiny forward windows when a meeting is close to a tenor.
+    - For each curve tenor, use the cumulative market rate from today to that tenor.
+    - Subtract the already-known model path up to the current solve start.
+    - Solve all currently unsolved meetings that are before the tenor and are at least
+      min_days_to_next_tenor days before that tenor.
+    - If a meeting is too close to the tenor, roll it into the next tenor bucket.
+
+    This avoids weird huge moves caused by solving a meeting with only a few days of exposure.
+    """
+    valuation_date = df_curve.attrs.get("valuation_date", dt.date.today())
+    valuation_date = to_date(valuation_date)
+
+    curve_nodes = df_curve.copy().sort_values("maturity").reset_index(drop=True)
+    curve_nodes["maturity_date"] = pd.to_datetime(curve_nodes["maturity"]).dt.date
+
+    curve_nodes = curve_nodes[
+        curve_nodes["maturity_date"] > valuation_date
+    ].copy()
+
+    if curve_nodes.empty:
+        raise ValueError("No valid TIIE RFR curve nodes after valuation date.")
+
+    meetings_df = model_meetings_df.copy()
+    meetings_df["Meeting Date"] = meetings_df["Meeting Date"].apply(to_date)
+    meetings_df["Effective Date"] = meetings_df["Effective Date"].apply(to_date)
+
+    meetings_df = meetings_df[
+        meetings_df["Effective Date"].apply(lambda x: actual_days(valuation_date, x) > 0)
+    ].copy()
+
+    requested_df = meetings_df[meetings_df["Requested"] == True].copy()
+    requested_df = requested_df.sort_values("Effective Date").reset_index(drop=True)
+
+    boundary_df = meetings_df[meetings_df["Boundary Only"] == True].copy()
+    boundary_df = boundary_df.sort_values("Effective Date").reset_index(drop=True)
+
+    if requested_df.empty:
+        raise ValueError("No requested meetings available after valuation date.")
+
+    meeting_rows = []
+    instrument_fit_rows = []
+    bucket_rows = []
+
+    previous_rate = float(current_on_rate_pct)
+    solved_effective_dates = set()
+
+    # This is the start date of the unsolved block.
+    # Initially today. After solving against a tenor, move this to that tenor.
+    solve_start_date = valuation_date
+
+    for _, inst in curve_nodes.iterrows():
+        maturity_date = inst["maturity_date"]
+        tenor_days = actual_days(valuation_date, maturity_date)
+
+        if tenor_days <= 0:
+            continue
+
+        market_rate = float(inst["rate"])
+        no_change_rate_to_tenor = no_change_zero_rate_to_date(
+            valuation_date=valuation_date,
+            maturity_date=maturity_date,
+            current_on_rate_pct=current_on_rate_pct,
+            basis=basis
+        )
+        
+        market_vs_no_change_bp = (
+            market_rate - no_change_rate_to_tenor
+        ) * 100.0 if np.isfinite(no_change_rate_to_tenor) else np.nan
+        target_total_log_factor = instrument_log_factor_from_annual_pct(
+            rate_pct=market_rate,
+            tenor_days=tenor_days,
+            basis=basis
+        )
+
+        if not np.isfinite(target_total_log_factor):
+            continue
+
+        # Unsolved meetings between the current solve start and this tenor.
+        candidates = requested_df[
+            (~requested_df["Effective Date"].isin(solved_effective_dates)) &
+            (requested_df["Effective Date"] > solve_start_date) &
+            (requested_df["Effective Date"] < maturity_date)
+        ].copy()
+        
+        candidates["Days to Tenor"] = candidates["Effective Date"].apply(
+            lambda x: actual_days(x, maturity_date)
+        )
+        
+        candidates = candidates.sort_values("Effective Date").reset_index(drop=True)
+        
+        if candidates.empty:
+            bucket_rows.append({
+                "Curve Bucket": inst["ID"],
+                "Tenor Date": maturity_date,
+                "Market Rate (%)": market_rate,
+                "Meetings Solved in Bucket": 0,
+                "Reason": "No unsolved meetings between solve start and tenor",
+                "Min Days to Tenor": int(min_days_to_next_tenor)
+            })
+            continue
+        
+        # If any candidate meeting is too close to this tenor, skip this tenor entirely.
+        # This prevents the model from solving part of the bucket and accidentally
+        # rolling over a meeting that should have remained unsolved.
+        too_close_mask = candidates["Days to Tenor"] < int(min_days_to_next_tenor)
+        
+        if too_close_mask.any():
+            bucket_rows.append({
+                "Curve Bucket": inst["ID"],
+                "Tenor Date": maturity_date,
+                "Market Rate (%)": market_rate,
+                "Meetings Solved in Bucket": 0,
+                "Reason": (
+                    "Skipped tenor because at least one unsolved meeting is too close "
+                    "to this tenor"
+                ),
+                "Closest Meeting": candidates.loc[too_close_mask, "Effective Date"].min(),
+                "Min Actual Days to Tenor": candidates["Days to Tenor"].min(),
+                "Min Days to Tenor": int(min_days_to_next_tenor)
+            })
+            continue
+        
+        eligible = candidates.copy()
+
+        # Known model log factor from today to solve_start_date.
+        known_log_to_start = model_log_factor_to_date(
+            valuation_date=valuation_date,
+            maturity_date=solve_start_date,
+            current_on_rate_pct=current_on_rate_pct,
+            meeting_table=pd.DataFrame(meeting_rows),
+            basis=basis
+        )
+
+        remaining_days = actual_days(solve_start_date, maturity_date)
+
+        if remaining_days <= 0:
+            continue
+
+        target_remaining_avg_daily_log = (
+            target_total_log_factor - known_log_to_start
+        ) / remaining_days
+
+        effective_dates = eligible["Effective Date"].tolist()
+
+        if len(effective_dates) == 1:
+            solved_rate = solve_single_meeting_rate_for_interval(
+                interval_start=solve_start_date,
+                interval_end=maturity_date,
+                meeting_date=effective_dates[0],
+                start_rate_pct=previous_rate,
+                target_avg_daily_log=target_remaining_avg_daily_log,
+                basis=basis
+            )
+
+            solved_rates = [solved_rate]
+            solved_terminal_rate = solved_rate
+            allocation_method_used = "Exact single-meeting cumulative solve"
+
+        else:
+            solved_rates, solved_terminal_rate = solve_multi_meeting_rates_for_interval(
+                interval_start=solve_start_date,
+                interval_end=maturity_date,
+                start_rate_pct=previous_rate,
+                meeting_dates=effective_dates,
+                target_avg_daily_log=target_remaining_avg_daily_log,
+                method=interpolation_method,
+                shape=interpolation_shape,
+                basis=basis
+            )
+
+            allocation_method_used = f"{interpolation_method} cumulative interpolation"
+
+        pre_rate = previous_rate
+
+        for k, (_, mtg) in enumerate(eligible.iterrows()):
+            meeting_date = mtg["Meeting Date"]
+            effective_date = mtg["Effective Date"]
+            post_rate = float(solved_rates[k])
+
+            if k + 1 < len(eligible):
+                segment_end = eligible.loc[k + 1, "Effective Date"]
+            else:
+                segment_end = maturity_date
+
+            expected_move = post_rate - pre_rate if np.isfinite(post_rate) else np.nan
+            expected_move_bp = expected_move * 100.0 if np.isfinite(expected_move) else np.nan
+
+            expected_steps, whole_steps, probability = decompose_hike_probability(
+                expected_move_pct=expected_move,
+                step_size_pct=step_size_pct
+            )
+
+            total_bucket_days = actual_days(solve_start_date, maturity_date)
+
+            if total_bucket_days > 0:
+                t_in_bucket = actual_days(solve_start_date, effective_date) / float(total_bucket_days)
+            else:
+                t_in_bucket = np.nan
+
+            meeting_rows.append({
+                "Meeting": meeting_date,
+                "Effective Date": effective_date,
+                "Segment End": segment_end,
+                "Curve Interval Start": solve_start_date,
+                "Curve Interval End": maturity_date,
+                "Curve Instrument": inst["ID"],
+                "Curve Instrument Rate (%)": market_rate,
+                "Forward Avg Rate (%)": annual_pct_from_daily_log(
+                    target_remaining_avg_daily_log,
+                    basis=basis
+                ),
+                "Interpolation Method": allocation_method_used,
+                "Interpolation t": t_in_bucket,
+                "Days to Tenor": actual_days(effective_date, maturity_date),
+                "Pre-Meeting O/N (%)": pre_rate,
+                "Post-Meeting O/N (%)": post_rate,
+                "Cumulative Move (%)": post_rate - current_on_rate_pct if np.isfinite(post_rate) else np.nan,
+                "Cumulative Move (bp)": (post_rate - current_on_rate_pct) * 100.0 if np.isfinite(post_rate) else np.nan,
+                "Expected Move (%)": expected_move,
+                "Expected Move (bp)": expected_move_bp,
+                "Expected Steps": expected_steps,
+                "# Steps": whole_steps,
+                "% of Step": probability,
+                "No-Change Rate to Tenor (%)": no_change_rate_to_tenor,
+                "Market vs No-Change (bp)": market_vs_no_change_bp
+            })
+
+            solved_effective_dates.add(effective_date)
+            pre_rate = post_rate
+            previous_rate = post_rate
+
+        bucket_rows.append({
+            "Curve Bucket": inst["ID"],
+            "Tenor Date": maturity_date,
+            "Market Rate (%)": market_rate,
+            "Meetings Solved in Bucket": len(eligible),
+            "Allocation Method": allocation_method_used,
+            "Solved Terminal Rate (%)": solved_terminal_rate,
+            "Solve Start Date": solve_start_date,
+            "Target Remaining Avg Rate (%)": annual_pct_from_daily_log(
+                target_remaining_avg_daily_log,
+                basis=basis
+            ),
+            "Min Days to Tenor": int(min_days_to_next_tenor)
+        })
+
+        # After fitting this tenor, the path is considered explained through this tenor.
+        solve_start_date = maturity_date
+
+        if len(solved_effective_dates) >= len(requested_df):
+            break
+
+    meeting_table = pd.DataFrame(meeting_rows)
+
+    if meeting_table.empty:
+        raise ValueError(
+            "No meeting path could be solved. Try lowering the minimum days-to-tenor input "
+            "or extending the curve horizon."
+        )
+
+    meeting_table = meeting_table.sort_values("Effective Date").reset_index(drop=True)
+
+    chart_end_date = get_chart_end_date(
+        meeting_table=meeting_table,
+        model_meetings_df=model_meetings_df,
+        curve_df=df_curve,
+        buffer_days=30
+    )
+
+    # Fit table only for displayed/model-relevant horizon.
+    fit_curve_nodes = curve_nodes[
+        curve_nodes["maturity_date"] <= chart_end_date
+    ].copy()
+
+    if fit_curve_nodes.empty:
+        fit_curve_nodes = curve_nodes.head(1).copy()
+
+    for _, inst in fit_curve_nodes.iterrows():
+        maturity_date = inst["maturity_date"]
+        tenor_days = actual_days(valuation_date, maturity_date)
+
+        if tenor_days <= 0:
+            continue
+
+        actual_rate = float(inst["rate"])
+
+        rebuilt_rate = model_zero_rate_to_date(
+            valuation_date=valuation_date,
+            maturity_date=maturity_date,
+            current_on_rate_pct=current_on_rate_pct,
+            meeting_table=meeting_table,
+            basis=basis
+        )
+
+        if np.isfinite(rebuilt_rate):
+            rate_error_bp = (actual_rate - rebuilt_rate) * 100.0
+        else:
+            rate_error_bp = np.nan
+
+        instrument_fit_rows.append({
+            "Instrument": inst["ID"],
+            "Instrument Maturity": maturity_date,
+            "Instrument Rate (%)": actual_rate,
+            "Model-Rebuilt Rate (%)": rebuilt_rate,
+            "Rate Error (bp)": rate_error_bp,
+            "Tenor Days": tenor_days,
+            "Used In Fit": True
+        })
+
+    instrument_fit_table = pd.DataFrame(instrument_fit_rows)
+    interval_allocation_table = pd.DataFrame(bucket_rows)
+
+    diagnostics = {
+        "Number of Instruments Used": int(len(curve_nodes)),
+        "Number of Meetings Solved": int(len(meeting_table)),
+        "Boundary Meeting Date": boundary_df["Meeting Date"].iloc[0] if not boundary_df.empty else "",
+        "Boundary Effective Date": boundary_df["Effective Date"].iloc[0] if not boundary_df.empty else "",
+        "Boundary Source": boundary_df["Boundary Source"].iloc[0] if not boundary_df.empty and "Boundary Source" in boundary_df.columns else "",
+        "Basis": basis,
+        "Min Unknown Days": min_unknown_days,
+        "Min Days to Next Tenor": int(min_days_to_next_tenor),
+        "Interpolation Method": interpolation_method,
+        "Interpolation Shape": interpolation_shape,
+        "Chart End Date": chart_end_date,
+        "Solver": "Cumulative tenor solve with meeting roll-forward threshold",
+        "Forward Curve Intervals": pd.DataFrame(),
+        "Interval Allocation Table": interval_allocation_table,
+        "Market Matrix Rank": np.nan,
+        "Singular Values": np.array([]),
+        "Condition Number": np.nan,
+        "Residual Sum of Squares": np.nan,
+        "Curve Side": df_curve.attrs.get("curve_side", ""),
+    }
+
+    return meeting_table, instrument_fit_table, diagnostics
+
+# =========================
+# SOLVER HELPERS
+# =========================
+def decompose_hike_probability(expected_move_pct, step_size_pct):
+    if step_size_pct == 0 or pd.isna(expected_move_pct):
+        return np.nan, np.nan, np.nan
+
+    expected_steps = expected_move_pct / step_size_pct
+
+    sign = np.sign(expected_steps)
+    abs_steps = abs(expected_steps)
+
+    whole_steps = int(np.floor(abs_steps))
+    probability = (abs_steps - whole_steps) * 100.0
+
+    return expected_steps, int(sign * whole_steps), sign * probability
+
+
+# =========================
+# OUTPUT TABLES
+# =========================
+def build_user_output_table(meeting_table):
+    df = meeting_table.copy()
+
+    keep_cols = [
+        "Meeting",
+        "Segment End",
+        "Curve Instrument",
+        "Interpolation Method",
+        "Days to Tenor",
+        "Curve Instrument Rate (%)",
+        "No-Change Rate to Tenor (%)",
+        "Market vs No-Change (bp)",
+        "Pre-Meeting O/N (%)",
+        "Post-Meeting O/N (%)",
+        "Expected Move (bp)",
+        "Cumulative Move (bp)",
+        "Expected Steps",
+        "% of Step"
+    ]
+
+    df = df[[c for c in keep_cols if c in df.columns]].copy()
+
+    df = df.rename(columns={
+        "Meeting": "Meeting Date",
+        "Segment End": "Priced Until",
+        "Curve Instrument": "Curve Bucket",
+        "Curve Instrument Rate (%)": "Market Rate (%)",
+        "No-Change Rate to Tenor (%)": "No-Change Rate (%)",
+        "Market vs No-Change (bp)": "Market - No Change (bp)",
+        "Pre-Meeting O/N (%)": "Pre O/N (%)",
+        "Post-Meeting O/N (%)": "Post O/N (%)",
+        "Expected Move (bp)": "Move (bp)",
+        "Cumulative Move (bp)": "Cum Move (bp)",
+        "Expected Steps": "Steps",
+        "% of Step": "% of Step"
+    })
+
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            if "bp" in col.lower():
+                df[col] = df[col].round(1)
+            elif "%" in col:
+                df[col] = df[col].round(3)
+            else:
+                df[col] = df[col].round(3)
+
+    return df
+
+def build_methodology_table(
+    curve_name,
+    curve_ticker,
+    on_ticker,
+    current_on_rate,
+    today,
+    year_end,
+    diagnostics,
+    max_fit_error
+):
+    rows = [
+        ["Curve", f"{curve_name} / {curve_ticker}"],
+        ["Curve Side", diagnostics.get("Curve Side", "")],
+        ["Current O/N", f"{on_ticker}: {current_on_rate:.3f}%"],
+        ["Meeting Horizon", f"Future rate decisions from {today} through {year_end}"],
+        ["Meeting Filter", "BQL central bank calendar; rate-decision events only"],
+        ["Solver", diagnostics.get("Solver", "Forward-interval meeting allocation")],
+        [
+            "Multiple Meetings per Curve Bucket",
+            "If more than one central bank meeting falls between two TIIE RFR tenors, "
+            "the model solves a terminal bucket rate and allocates meeting levels using "
+            "the selected interpolation method."
+        ],
+        ["Interpolation Method", diagnostics.get("Interpolation Method", "")],
+        [
+            "Interpolation Shape",
+            f"{diagnostics.get('Interpolation Shape', '')}. Used only for Front-loaded "
+            "and Back-loaded methods. Shape=2 means quadratic. Linear, Exponential, "
+            "Smoothstep, Jump then flat, and Flat then jump do not need this parameter."
+        ],
+        [
+            "Minimum Days to Next Tenor",
+            f"{diagnostics.get('Min Days to Next Tenor', '')}. If a meeting is closer than "
+            "this to the next curve tenor, that tenor is skipped for that meeting and the "
+            "meeting is solved against the next usable tenor."
+        ],
+        [
+            "Fit Error Definition",
+            "Maximum absolute difference, in bp, between market TIIE RFR curve rates "
+            "and model-rebuilt rates for instruments inside the displayed/model-relevant "
+            "horizon only."
+        ],
+        ["Chart End Date", str(diagnostics.get("Chart End Date", ""))],
+        ["Boundary Date", str(diagnostics.get("Boundary Meeting Date", ""))],
+        ["Boundary Source", diagnostics.get("Boundary Source", "")],
+        ["Meetings Solved", diagnostics.get("Number of Meetings Solved", "")],
+        ["Instruments Used", diagnostics.get("Number of Instruments Used", "")],
+        [
+            "Max Displayed-Horizon Fit Error",
+            f"{max_fit_error:.2f} bp" if np.isfinite(max_fit_error) else "N/A"
+        ]
+    ]
+
+    return pd.DataFrame(rows, columns=["Item", "Value"])
+# =========================
+# CHART
+# =========================
+def build_policy_dashboard(
+    meeting_table,
+    curve_df,
+    current_on_rate,
+    title,
+    chart_end_date=None,
+    basis=360
+):
+    """
+    Chart now shows:
+    1. TIIE RFR market curve, starting from current O/N.
+    2. Model-rebuilt zero curve from the implied meeting path.
+    3. Implied post-meeting O/N path as a step graph.
+
+    The red current O/N line is removed.
+    """
+    mtg = meeting_table.copy()
+
+    if mtg.empty:
+        raise ValueError("No meeting results to plot.")
+
+    valuation_date = curve_df.attrs.get("valuation_date", dt.date.today())
+    valuation_date = to_date(valuation_date)
+
+    if chart_end_date is None:
+        chart_end_date = get_chart_end_date(
+            meeting_table=meeting_table,
+            curve_df=curve_df,
+            buffer_days=30
+        )
+
+    chart_end_date = to_date(chart_end_date)
+
+    curve_plot_df = build_curve_plot_nodes_with_on_anchor(
+        curve_df=curve_df,
+        current_on_rate=current_on_rate,
+        chart_end_date=chart_end_date
+    )
+
+    if curve_plot_df.empty:
+        raise ValueError("No TIIE RFR curve nodes available for charting.")
+
+    # Smooth market curve including current O/N anchor.
+    smooth_market_df = smooth_curve_points(
+        curve_plot_df=curve_plot_df,
+        valuation_date=valuation_date,
+        max_points=250
+    )
+
+    # Model-rebuilt zero curve, using same x-grid as market smooth curve.
+    rebuilt_rates = []
+
+    for d in smooth_market_df["date"]:
+        rebuilt_rate = model_zero_rate_to_date(
+            valuation_date=valuation_date,
+            maturity_date=d.date(),
+            current_on_rate_pct=current_on_rate,
+            meeting_table=meeting_table,
+            basis=basis
+        )
+        rebuilt_rates.append(rebuilt_rate)
+
+    smooth_market_df["model_rebuilt_rate"] = rebuilt_rates
+    no_change_rates = []
+
+    for d in smooth_market_df["date"]:
+        no_change_rate = no_change_zero_rate_to_date(
+            valuation_date=valuation_date,
+            maturity_date=d.date(),
+            current_on_rate_pct=current_on_rate,
+            basis=basis
+        )
+        no_change_rates.append(no_change_rate)
+    
+    smooth_market_df["no_change_rate"] = no_change_rates
+    
+
+    # Step path starts at valuation date and continues through chart end.
+    mtg["Effective_dt"] = pd.to_datetime(mtg["Effective Date"])
+    mtg = mtg.sort_values("Effective_dt").reset_index(drop=True)
+
+    step_dates = [pd.Timestamp(valuation_date)]
+    step_rates = [float(current_on_rate)]
+
+    for _, row in mtg.iterrows():
+        step_dates.append(pd.Timestamp(row["Effective Date"]))
+        step_rates.append(float(row["Post-Meeting O/N (%)"]))
+
+    step_dates.append(pd.Timestamp(chart_end_date))
+    step_rates.append(step_rates[-1])
+
+    fig = go.Figure()
+
+    # TIIE RFR market curve.
+    fig.add_trace(
+        go.Scatter(
+            x=smooth_market_df["date"],
+            y=smooth_market_df["rate"],
+            mode="lines",
+            name="TIIE RFR Market Curve",
+            line=dict(width=3, color="#00C2FF"),
+            hovertemplate="Date=%{x|%Y-%m-%d}<br>Market Curve=%{y:.3f}%<extra></extra>"
+        )
+    )
+
+    # TIIE RFR market nodes.
+    fig.add_trace(
+        go.Scatter(
+            x=pd.to_datetime(curve_plot_df["maturity"]),
+            y=curve_plot_df["rate"],
+            mode="markers",
+            name="TIIE RFR Nodes + O/N Anchor",
+            marker=dict(size=8, color="#00C2FF", symbol="circle-open"),
+            hovertemplate="Date=%{x|%Y-%m-%d}<br>Rate=%{y:.3f}%<extra></extra>"
+        )
+    )
+
+    # Model-rebuilt zero curve from meeting path.
+    fig.add_trace(
+        go.Scatter(
+            x=smooth_market_df["date"],
+            y=smooth_market_df["model_rebuilt_rate"],
+            mode="lines",
+            name="Model-Rebuilt Zero Curve",
+            line=dict(width=2.5, color="#7CFF6B", dash="dash"),
+            hovertemplate="Date=%{x|%Y-%m-%d}<br>Model Zero=%{y:.3f}%<extra></extra>"
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=smooth_market_df["date"],
+            y=smooth_market_df["no_change_rate"],
+            mode="lines",
+            name="No-Change Carry Curve",
+            line=dict(width=2, color="#AAAAAA", dash="dot"),
+            hovertemplate="Date=%{x|%Y-%m-%d}<br>No-Change Carry=%{y:.3f}%<extra></extra>"
+        )
+    )
+    # Implied meeting path as step function.
+    fig.add_trace(
+        go.Scatter(
+            x=step_dates,
+            y=step_rates,
+            mode="lines+markers",
+            name="Implied Post-Meeting O/N Path",
+            line=dict(width=3, color="#FFB000", shape="hv"),
+            marker=dict(size=7, color="#FFB000"),
+            hovertemplate="Date=%{x|%Y-%m-%d}<br>Post-Meeting O/N=%{y:.3f}%<extra></extra>"
+        )
+    )
+
+    fig.add_vline(
+        x=pd.Timestamp(valuation_date),
+        line_width=1,
+        line_dash="dot",
+        line_color="orange"
+    )
+
+    fig.add_annotation(
+        x=pd.Timestamp(valuation_date),
+        y=1.02,
+        yref="paper",
+        xanchor="left",
+        yanchor="bottom",
+        text="Today",
+        showarrow=False,
+        font=dict(color="orange")
+    )
+
+    visible_rates = []
+    visible_rates.extend(list(smooth_market_df["rate"].dropna()))
+    visible_rates.extend(list(smooth_market_df["model_rebuilt_rate"].dropna()))
+    visible_rates.extend(list(smooth_market_df["no_change_rate"].dropna()))
+    visible_rates.extend(step_rates)
+
+    y_min = min(visible_rates)
+    y_max = max(visible_rates)
+    y_pad = max((y_max - y_min) * 0.15, 0.05)
+
+    fig.update_yaxes(
+        title_text="Rate (%)",
+        range=[y_min - y_pad, y_max + y_pad]
+    )
+
+    fig.update_xaxes(
+        title_text="Date",
+        range=[pd.Timestamp(valuation_date), pd.Timestamp(chart_end_date)],
+        tickformat="%Y-%m-%d"
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.02,
+            y=0.96,
+            xanchor="left",
+            yanchor="top"
+        ),
+        height=700,
+        template="plotly_dark",
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.18,
+            xanchor="left",
+            x=0.0,
+            bgcolor="rgba(0,0,0,0)"
+        ),
+        margin=dict(t=90, r=35, l=75, b=130)
+    )
+
+    return go.FigureWidget(fig)
+
+# =========================
+# UI
+# =========================
+min_days_to_tenor_input = widgets.IntText(
+    value=DEFAULT_MODEL_CONFIG["min_days_to_next_tenor"],
+    description="Min days to tenor:",
+    layout={"width": "190px"},
+    style={"description_width": "initial"}
+)
+
+min_days_help = widgets.HTML(
+    value="""
+    <span style='color:#aaa; font-size:12px;'>
+    If a meeting is closer than this many days to the next tenor, the model rolls it to the next tenor bucket.
+    </span>
+    """,
+    layout={"width": "430px", "margin": "4px 0 0 0"}
+)
+country_dd = widgets.Dropdown(
+    options=list(COUNTRY_MAP.keys()),
+    value="Mexico",
+    description="Country:",
+    layout={"width": "190px"},
+    style={"description_width": "initial"}
+)
+
+curve_dd = widgets.Dropdown(
+    options=list(CURVE_MAP.keys()),
+    value="MXN_TIIE_RFR",
+    description="Curve:",
+    layout={"width": "220px"},
+    style={"description_width": "initial"}
+)
+
+curve_side_dd = widgets.Dropdown(
+    options=CURVE_SIDES,
+    value=DEFAULT_MODEL_CONFIG["curve_side"],
+    description="Curve side:",
+    layout={"width": "180px"},
+    style={"description_width": "initial"}
+)
+
+interpolation_dd = widgets.Dropdown(
+    options=INTERPOLATION_METHODS,
+    value=DEFAULT_MODEL_CONFIG["interpolation_method"],
+    description="Interpolation:",
+    layout={"width": "260px"},
+    style={"description_width": "initial"}
+)
+
+shape_input = widgets.FloatText(
+    value=DEFAULT_MODEL_CONFIG["interpolation_shape"],
+    description="Shape p:",
+    layout={"width": "150px"},
+    style={"description_width": "initial"}
+)
+
+shape_help = widgets.HTML(
+    value="""
+    <span style='color:#aaa; font-size:12px;'>
+    Shape is used only for Front-loaded / Back-loaded. 2 = quadratic.
+    </span>
+    """,
+    layout={"width": "360px", "margin": "4px 0 0 0"}
+)
+
+show_diagnostics_cb = widgets.Checkbox(
+    value=False,
+    description="Show diagnostics",
+    layout={"width": "180px"}
+)
+
+run_button = widgets.Button(
+    description="Run",
+    button_style="success",
+    layout={"width": "80px"}
+)
+
+spinner = widgets.HTML(
+    """<i class="fa fa-spinner fa-spin" style="font-size: 18px"></i>""",
+    layout={
+        "visibility": "hidden",
+        "margin": "8px 0 0 10px",
+        "width": "40px"
+    }
+)
+
+exception = widgets.HTML(
+    layout={
+        "width": "1000px",
+        "margin": "8px 0 0 0"
+    }
+)
+
+output_container = widgets.VBox()
+chart_container = widgets.HBox()
+
+controls = widgets.VBox([
+    widgets.HBox([
+        country_dd,
+        curve_dd,
+        curve_side_dd,
+        interpolation_dd,
+        shape_input,
+        shape_help,
+        min_days_to_tenor_input,
+        min_days_help,
+        show_diagnostics_cb
+    ]),
+    widgets.HBox([run_button, spinner, exception])
+])
+
+ui_display = widgets.VBox(
+    [controls, output_container, chart_container],
+    layout={"min_width": "max-content"}
+)
+
+clear_output()
+display(ui_display)
+
+
+# =========================
+# RUN
+# =========================
+def run(event=None):
+    min_days_to_next_tenor = int(min_days_to_tenor_input.value)
+    spinner.layout.visibility = "visible"
+    exception.value = ""
+    output_container.children = []
+    chart_container.children = []
+
+    try:
+        cfg = DEFAULT_MODEL_CONFIG.copy()
+
+        country_name = country_dd.value
+        curve_name = curve_dd.value
+        curve_side = curve_side_dd.value
+        interpolation_method = interpolation_dd.value
+        interpolation_shape = safe_float(shape_input.value, cfg["interpolation_shape"])
+
+        curve_df = get_curve_data(
+            curve_name=curve_name,
+            curve_side=curve_side,
+            verbose=False
+        )
+        curve_ticker = curve_df.attrs.get("curve_ticker", CURVE_MAP[curve_name])
+        front_rate_anchor = curve_df.attrs.get("front_rate_anchor", np.nan)
+
+        current_on_rate, on_ticker = get_current_overnight_rate(
+            country_name=country_name,
+            verbose=False
+        )
+
+        model_meetings_df, today, year_end = build_meeting_calendar_for_model(
+            country_name=country_name,
+            effective_lag_days=cfg["effective_lag_days"],
+            boundary_lookahead_days=cfg["boundary_lookahead_days"]
+        )
+
+        meeting_table, instrument_fit_table, diagnostics = solve_meeting_levels_interpolated(
+            df_curve=curve_df,
+            model_meetings_df=model_meetings_df,
+            current_on_rate_pct=current_on_rate,
+            step_size_pct=cfg["step_size_pct"],
+            basis=cfg["basis"],
+            interpolation_method=interpolation_method,
+            interpolation_shape=interpolation_shape,
+            min_unknown_days=cfg["min_unknown_days"],
+            min_days_to_next_tenor=min_days_to_next_tenor
+        )
+
+        max_fit_error = instrument_fit_table["Rate Error (bp)"].abs().max()
+
+        methodology_df = build_methodology_table(
+            curve_name=curve_name,
+            curve_ticker=curve_ticker,
+            on_ticker=on_ticker,
+            current_on_rate=current_on_rate,
+            today=today,
+            year_end=year_end,
+            diagnostics=diagnostics,
+            max_fit_error=max_fit_error
+        )
+
+        user_table = build_user_output_table(meeting_table)
+
+        warnings = []
+
+        if np.isfinite(front_rate_anchor):
+            anchor_diff_bp = (front_rate_anchor - current_on_rate) * 100.0
+
+            if abs(anchor_diff_bp) > 10:
+                warnings.append(
+                    f"Warning: front curve anchor differs from current O/N by {anchor_diff_bp:.1f} bp."
+                )
+
+        if interpolation_method in ["Front-loaded", "Back-loaded"] and interpolation_shape <= 0:
+            warnings.append(
+                "Warning: interpolation shape must be positive. The model used the default shape of 2.0."
+            )
+
+        if max_fit_error is not None and np.isfinite(max_fit_error) and abs(max_fit_error) > 10:
+            warnings.append(
+                f"Note: displayed-horizon max fit error is {max_fit_error:.2f} bp. "
+                "Fit error is calculated only over the visible/model-relevant TIIE RFR curve horizon."
+            )
+
+        output_widgets = []
+
+        warning_html = ""
+        if len(warnings) > 0:
+            warning_html = "<br>".join(warnings)
+
+        output_widgets.append(
+            widgets.HTML(
+                value=f"""
+                <h3>Methodology</h3>
+                {warning_html}
+                """
+            )
+        )
+
+        output_widgets.append(render_dataframe_html(methodology_df))
+
+        output_widgets.append(widgets.HTML(value="<h3>Implied Meeting Path</h3>"))
+
+        output_widgets.append(render_dataframe_html(user_table))
+
+        output_widgets.append(
+            widgets.HTML(value=f"<b>Max instrument fit error:</b> {max_fit_error:.2f} bp")
+        )
+
+        if show_diagnostics_cb.value:
+            output_widgets.append(widgets.HTML(value="<h3>Diagnostics</h3>"))
+
+            diag_out = widgets.Output()
+            with diag_out:
+                print("Diagnostics")
+                for k, v in diagnostics.items():
+                    if k in ["Forward Curve Intervals", "Interval Allocation Table"]:
+                        continue
+
+                    if k == "Singular Values":
+                        print(f"{k}: {np.array2string(v, precision=6)}")
+                    else:
+                        print(f"{k}: {v}")
+
+                print("\nFiltered Model Meeting Calendar")
+            output_widgets.append(diag_out)
+
+            output_widgets.append(render_dataframe_html(model_meetings_df, max_height_px=300))
+
+            output_widgets.append(widgets.HTML(value="<h4>Instrument Fit Table</h4>"))
+            output_widgets.append(render_dataframe_html(instrument_fit_table, max_height_px=350))
+
+            output_widgets.append(widgets.HTML(value="<h4>Forward Curve Intervals</h4>"))
+            output_widgets.append(render_dataframe_html(diagnostics["Forward Curve Intervals"], max_height_px=350))
+
+            output_widgets.append(widgets.HTML(value="<h4>Interval Allocation Table</h4>"))
+            output_widgets.append(render_dataframe_html(diagnostics["Interval Allocation Table"], max_height_px=350))
+
+            curve_nodes_display = curve_df[
+                [
+                    "ID",
+                    "valuation_date",
+                    "maturity",
+                    "days_to_maturity",
+                    "T_360",
+                    "rate"
+                ]
+            ].copy()
+
+            output_widgets.append(widgets.HTML(value="<h4>Curve Nodes</h4>"))
+            output_widgets.append(render_dataframe_html(curve_nodes_display, max_height_px=350))
+
+        output_container.children = output_widgets
+
+        chart_end_date = diagnostics.get("Chart End Date", None)
+
+        fig = build_policy_dashboard(
+            meeting_table=meeting_table,
+            curve_df=curve_df,
+            current_on_rate=current_on_rate,
+            title=f"{country_name} {curve_name}: Market Curve vs Model-Implied Meeting Path - {interpolation_method}",
+            chart_end_date=chart_end_date,
+            basis=cfg["basis"]
+        )
+
+        chart_container.children = [fig]
+
+    except Exception as e:
+        exception.value = f"<p style='word-wrap: break-word; color: red;'>Error: {e}</p>"
+
+    finally:
+        spinner.layout.visibility = "hidden"
+
+
+run_button.on_click(run)
