@@ -1,0 +1,1976 @@
+from __future__ import annotations
+
+"""
+Global EM Implied Monetary Policy Pricer
+========================================
+
+Single-file BQuant version containing:
+
+1. Country configuration and market-data loading
+2. Short-rate curve construction
+3. Meeting-by-meeting policy-path calibration
+4. Scenario and trade valuation
+5. Interactive dashboard
+6. Notebook launch code
+
+In BQuant, place this file in the project folder and run:
+
+    from em_pricer_all_in_one import GlobalEMPolicyPricer
+    dashboard = GlobalEMPolicyPricer()
+    dashboard.display()
+    dashboard.run(refresh=True)
+
+Alternatively, execute this file directly in a notebook with `%run`.
+"""
+
+from dataclasses import dataclass, replace
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import HTML, Markdown, clear_output, display
+
+try:
+    import bql
+except Exception:
+    bql = None
+
+
+# =============================================================================
+# 1. COUNTRY CONFIGURATION AND MARKET DATA
+# =============================================================================
+
+@dataclass(frozen=True)
+class CountryConfig:
+    code: str
+    name: str
+    currency: str
+    instrument_name: str
+    curve_name: str
+    as_of_date: pd.Timestamp
+    policy_rate: float
+    effective_overnight_rate: float
+    overnight_policy_basis_bps: float
+    standard_move_bps: float
+    day_count_basis: int
+    spot_lag_days: int
+    policy_ticker: str | None
+    meeting_dates: tuple[pd.Timestamp, ...]
+    quotes: tuple[tuple[str, str, float, int], ...]
+    calibration_tenors: tuple[str, ...]
+    validation_tenors: tuple[str, ...]
+    trade_tenors: tuple[str, ...]
+    move_lower_bound_bps: float
+    move_upper_bound_bps: float
+    notes: str
+    wipr_benchmark: tuple[tuple[str, float, float], ...] = ()
+    # If set, this country's curve is a Bloomberg "curve object" (pulled via
+    # bq.univ.curvemembers()) rather than a fixed list of individually named
+    # instrument tickers. When curve_ticker is populated, `quotes` is only
+    # used as a UI placeholder / fallback and Live BQL is the primary path.
+    curve_ticker: str | None = None
+
+
+COUNTRIES: Dict[str, CountryConfig] = {
+    "Turkey": CountryConfig(
+        code="TR",
+        name="Turkey",
+        currency="TRY",
+        instrument_name="OIS",
+        curve_name="TRY OIS",
+        as_of_date=pd.Timestamp("2026-07-11"),
+        policy_rate="TUBR1WA Index",
+        effective_overnight_rate="BISTTREF Index",
+        overnight_policy_basis_bps=299.35,
+        standard_move_bps=250.0,
+        day_count_basis=360,
+        spot_lag_days=2,
+        policy_ticker="TUBR1WRA Index",
+        meeting_dates=tuple(pd.to_datetime([
+            "2026-07-23", "2026-09-10", "2026-10-22", "2026-12-10"
+        ])),
+        quotes=(
+            ("1W", "TYSO1Z BGN Curncy", 40.049005, 7),
+            ("2W", "TYSO2Z BGN Curncy", 39.800000, 14),
+            ("1M", "TYSOA BGN Curncy", 39.220000, 30),
+            ("2M", "TYSOB BGN Curncy", 39.440000, 60),
+            ("3M", "TYSOC BGN Curncy", 39.740000, 91),
+            ("6M", "TYSOF BGN Curncy", 38.920000, 182),
+            ("9M", "TYSOI BGN Curncy", 38.260000, 273),
+            ("1Y", "TYSO1 BGN Curncy", 37.720000, 365),
+        ),
+        calibration_tenors=("1W", "2W", "1M", "2M", "3M", "6M"),
+        validation_tenors=("9M", "1Y"),
+        trade_tenors=("1M", "2M", "3M", "6M"),
+        move_lower_bound_bps=-500.0,
+        move_upper_bound_bps=250.0,
+        notes=(
+            "Snapshot from the supplied Bloomberg TRY OIS curve. "
+            "9M and 1Y remain validation tenors until the 2027 CBRT calendar is loaded."
+        ),
+    ),
+    "Mexico": CountryConfig(
+        code="MX",
+        name="Mexico",
+        currency="MXN",
+        instrument_name="TIIE-F RFR OIS",
+        curve_name="MXN TIIE-F RFR",
+        as_of_date=pd.Timestamp("2026-06-27"),
+        policy_rate="MXONBR Index",
+        effective_overnight_rate="MXONBR Index",
+        overnight_policy_basis_bps=0.0,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        spot_lag_days=2,
+        policy_ticker="MXONBR Index",
+        meeting_dates=tuple(pd.to_datetime([
+            "2026-08-06", "2026-09-24", "2026-11-05", "2026-12-17"
+        ])),
+        quotes=(
+            ("1M", "MPSWFA BGN Curncy", 6.5250, 30),
+            ("2M", "MPSWFB BGN Curncy", 6.5375, 60),
+            ("3M", "MPSWFC BGN Curncy", 6.5450, 91),
+            ("6M", "MPSWFF BGN Curncy", 6.5800, 182),
+            ("9M", "MPSWFI BGN Curncy", 6.6290, 273),
+            ("1Y", "MPSWF1A BGN Curncy", 6.7000, 364),
+        ),
+        calibration_tenors=("1M", "2M", "3M", "6M"),
+        validation_tenors=("9M", "1Y"),
+        trade_tenors=("1M", "2M", "3M", "6M"),
+        move_lower_bound_bps=-100.0,
+        move_upper_bound_bps=100.0,
+        notes=(
+            "Prototype uses the supplied MXN TIIE-F RFR curve snapshot. "
+            "The desk should confirm whether this RFR curve or the legacy 28-day TIIE "
+            "curve is the required production instrument and validate the O/N-policy basis."
+        ),
+    ),
+    "Chile": CountryConfig(
+        code="CL",
+        name="Chile",
+        currency="CLP",
+        instrument_name="Cámara OIS",
+        curve_name="CLP vs Cámara",
+        as_of_date=pd.Timestamp("2026-06-30"),
+        policy_rate=4.50,
+        effective_overnight_rate="ECSRCL Index",
+        overnight_policy_basis_bps=0.0,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        spot_lag_days=0,
+        policy_ticker="CHOVCHOV Index",
+        meeting_dates=tuple(pd.to_datetime([
+            "2026-07-28", "2026-09-08", "2026-10-27", "2026-12-15"
+        ])),
+        quotes=(
+            ("1M", "CHSWNIA BGN Curncy", 4.4950, 30),
+            ("2M", "CHSWNIB BGN Curncy", 4.5000, 60),
+            ("3M", "CHSWNIC BGN Curncy", 4.5100, 91),
+            ("6M", "CHSWNIF BGN Curncy", 4.5050, 182),
+            ("9M", "CHSWNII BGN Curncy", 4.5050, 273),
+            ("1Y", "CHSWNI1 BGN Curncy", 4.5200, 360),
+        ),
+        calibration_tenors=("1M", "2M", "3M", "6M"),
+        validation_tenors=("9M", "1Y"),
+        trade_tenors=("1M", "2M", "3M", "6M"),
+        move_lower_bound_bps=-100.0,
+        move_upper_bound_bps=100.0,
+        notes=(
+            "Prototype uses midpoints from the supplied CLP vs Cámara curve. "
+            "Confirm exact Bloomberg tickers, settlement lag and Cámara/OIS conventions "
+            "with the Chile rates desk before production use."
+        ),
+    ),
+    "Colombia": CountryConfig(
+        code="CO",
+        name="Colombia",
+        currency="COP",
+        instrument_name="IBR OIS",
+        curve_name="COP IBR",
+        as_of_date=pd.Timestamp("2026-07-13"),
+        policy_rate="CORRRMIN Index",
+        effective_overnight_rate="COOVIBR Index",
+        overnight_policy_basis_bps=0.0,
+        standard_move_bps=50.0,
+        day_count_basis=360,
+        spot_lag_days=0,
+        policy_ticker="CORRMIN Index",
+        meeting_dates=tuple(pd.to_datetime([
+            "2026-07-31", "2026-09-30", "2026-10-30", "2026-12-18"
+        ])),
+        # No static Bloomberg snapshot was supplied for the IBR curve. This
+        # market is read live from the YCSW0329 Index curve object -- see
+        # curve_ticker below -- so quotes stays empty and Snapshot mode is
+        # unavailable until real quote levels are captured and hardcoded.
+        quotes=(),
+        curve_ticker="YCSW0329 Index",
+        calibration_tenors=("1M", "2M", "3M", "6M"),
+        validation_tenors=("9M", "1Y"),
+        trade_tenors=("1M", "2M", "3M", "6M"),
+        move_lower_bound_bps=-300.0,
+        move_upper_bound_bps=300.0,
+        notes=(
+            "Curve is pulled live from the COP IBR curve object (YCSW0329 Index) "
+            "via bq.univ.curvemembers(); there is no offline snapshot, so use "
+            "'Live BQL' as the data source for this country. The current O/N-policy "
+            "rate ticker is CORRMIN Index. BanRep moved in 100 bp increments through "
+            "H1 2026 (rate at 11.25% as of the April 30, 2026 decision) -- the "
+            "standard_move_bps and move bounds above are set wide to reflect that; "
+            "tighten them once the desk confirms BanRep's expected step size for the "
+            "remainder of 2026. Meeting dates reflect BanRep's published 2026 rate-decision "
+            "calendar (Jan 30, Mar 31, Apr 30, Jun 30, Jul 31, Sep 30, Oct 30, Dec 18); "
+            "only meetings from today forward are listed here."
+        ),
+    ),
+    "Hungary": CountryConfig(
+        code="HU",
+        name="Hungary",
+        currency="HUF",
+        instrument_name="BUBOR 3M OIS/IRS",
+        curve_name="HUF BUBOR 3M",
+        as_of_date=pd.Timestamp("2026-07-13"),
+        policy_rate="HBBRANN Index",
+        effective_overnight_rate="BUBORON Index",
+        overnight_policy_basis_bps=0.0,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        spot_lag_days=2,
+        policy_ticker="HBBRDEPO Index",
+        meeting_dates=tuple(pd.to_datetime([
+            "2026-07-28", "2026-08-25", "2026-09-22",
+            "2026-10-27", "2026-11-24", "2026-12-15"
+        ])),
+        # No static snapshot supplied for the BUBOR 3M curve either; it is
+        # pulled live from the YCSW0324 Index curve object.
+        quotes=(),
+        curve_ticker="YCSW0324 Index",
+        calibration_tenors=("1M", "2M", "3M", "6M"),
+        validation_tenors=("9M", "1Y"),
+        trade_tenors=("1M", "2M", "3M", "6M"),
+        move_lower_bound_bps=-150.0,
+        move_upper_bound_bps=100.0,
+        notes=(
+            "Curve is pulled live from the HUF BUBOR 3M curve object (YCSW0324 Index) "
+            "via bq.univ.curvemembers(); use 'Live BQL' as the data source since there "
+            "is no offline snapshot. The overnight/deposit rate ticker is HBBRDEPO Index. "
+            "The Monetary Council cut the base rate 25 bp to 6.00% on 23 June 2026. "
+            "Only the March/June/September/December meetings (tied to the quarterly "
+            "Inflation Report) are officially confirmed by the MNB; the intervening "
+            "monthly dates above (Jul/Aug/Oct/Nov) are estimated from the recent ~4-week "
+            "cadence and should be reconciled against the MNB's published Monetary "
+            "Council calendar before trading off this model."
+        ),
+    ),
+}
+
+
+TENOR_DAYS = {
+    "1W": 7,
+    "2W": 14,
+    "1M": 30,
+    "2M": 60,
+    "3M": 91,
+    "6M": 182,
+    "9M": 273,
+    "1Y": 365,
+}
+
+
+class MarketData:
+    @staticmethod
+    def snapshot(config: CountryConfig) -> pd.DataFrame:
+        if not config.quotes:
+            raise RuntimeError(
+                f"No offline snapshot quotes are available for {config.name}. "
+                "This country's curve is only wired up for the 'Live BQL' data "
+                "source (it reads the curve object "
+                f"'{config.curve_ticker}' directly). Switch the Data toggle to "
+                "'Live BQL' and click Refresh market."
+            )
+        return pd.DataFrame(
+            config.quotes,
+            columns=["tenor", "ticker", "par_rate", "tenor_days"],
+        ).assign(source=f"Snapshot {config.as_of_date.date()}")
+
+    @staticmethod
+    def _nearest_tenor_label(tenor_days: float, tolerance: float = 0.25) -> str | None:
+        """
+        Buckets a raw day-count to the closest label in TENOR_DAYS, provided
+        it is within `tolerance` (relative) of that bucket. Returns None if
+        no bucket is close enough, so odd/off-market curve members are
+        dropped rather than mislabeled.
+        """
+        best_label = None
+        best_relative_gap = None
+
+        for label, days in TENOR_DAYS.items():
+            relative_gap = abs(tenor_days - days) / float(days)
+            if best_relative_gap is None or relative_gap < best_relative_gap:
+                best_relative_gap = relative_gap
+                best_label = label
+
+        if best_relative_gap is not None and best_relative_gap <= tolerance:
+            return best_label
+        return None
+
+    @staticmethod
+    def live_curve_from_curve_object(config: CountryConfig, service=None) -> pd.DataFrame:
+        """
+        Pulls a Bloomberg curve object (e.g. YCSW0329 Index / YCSW0324 Index)
+        via bq.univ.curvemembers(), fetches each member's MID curve rate and
+        maturity, and buckets maturities onto the standard tenor labels this
+        engine understands (see TENOR_DAYS).
+        """
+        if bql is None:
+            raise RuntimeError("BQL is unavailable in this environment.")
+
+        service = service or bql.Service()
+
+        universe = service.univ.curvemembers(symbols=config.curve_ticker)
+        rate_request = bql.Request(
+            universe,
+            {"curve_rate": service.data.curve_rate(side="MID")},
+        )
+        rate_raw = service.execute(rate_request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in rate_raw.columns else rate_raw.columns[0]
+        rate_col = "curve_rate" if "curve_rate" in rate_raw.columns else rate_raw.columns[-1]
+
+        members = pd.DataFrame({
+            "ticker": rate_raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(rate_raw[rate_col], errors="coerce"),
+        }).dropna(subset=["par_rate"])
+
+        if members.empty:
+            raise RuntimeError(
+                f"No curve members/rates returned for {config.curve_ticker}."
+            )
+
+        maturity_request = bql.Request(
+            members["ticker"].tolist(),
+            {"maturity": service.data.maturity()},
+        )
+        maturity_raw = service.execute(maturity_request)[0].df().reset_index()
+
+        mat_id_col = "ID" if "ID" in maturity_raw.columns else maturity_raw.columns[0]
+        mat_col = "maturity" if "maturity" in maturity_raw.columns else maturity_raw.columns[-1]
+
+        maturities = pd.DataFrame({
+            "ticker": maturity_raw[mat_id_col].astype(str),
+            "maturity": pd.to_datetime(maturity_raw[mat_col], errors="coerce"),
+        })
+
+        merged = members.merge(maturities, on="ticker", how="left")
+        merged = merged.dropna(subset=["maturity"])
+
+        merged["tenor_days"] = (
+            merged["maturity"] - config.as_of_date
+        ).dt.days
+        merged = merged[merged["tenor_days"] > 0].copy()
+
+        merged["tenor"] = merged["tenor_days"].apply(
+            MarketData._nearest_tenor_label
+        )
+        merged = merged.dropna(subset=["tenor"])
+
+        # If multiple members bucket into the same label, keep the one
+        # closest to that label's canonical day-count.
+        merged["_label_days"] = merged["tenor"].map(TENOR_DAYS)
+        merged["_gap"] = (merged["tenor_days"] - merged["_label_days"]).abs()
+        merged = merged.sort_values("_gap").drop_duplicates("tenor", keep="first")
+        merged = merged.sort_values("tenor_days").reset_index(drop=True)
+
+        merged["source"] = "Live BQL (curve object)"
+        result = merged[["tenor", "ticker", "par_rate", "tenor_days", "source"]].copy()
+
+        if len(result) < 3:
+            raise RuntimeError(
+                f"Only {len(result)} usable tenor points came back from "
+                f"{config.curve_ticker} after bucketing to standard tenors; "
+                "at least 3 are required."
+            )
+        return result
+
+    @staticmethod
+    def live_curve(config: CountryConfig, service=None) -> pd.DataFrame:
+        if bql is None:
+            raise RuntimeError("BQL is unavailable in this environment.")
+
+        service = service or bql.Service()
+
+        if config.curve_ticker:
+            return MarketData.live_curve_from_curve_object(config, service)
+
+        tickers = [row[1] for row in config.quotes]
+        ticker_to_tenor = {row[1]: row[0] for row in config.quotes}
+        tenor_to_days = {row[0]: row[3] for row in config.quotes}
+
+        request = bql.Request(tickers, {"par_rate": service.data.px_last()})
+        raw = service.execute(request)[0].df().reset_index()
+
+        id_col = "ID" if "ID" in raw.columns else raw.columns[0]
+        value_col = "par_rate" if "par_rate" in raw.columns else raw.columns[-1]
+
+        result = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[value_col], errors="coerce"),
+        })
+        result["tenor"] = result["ticker"].map(ticker_to_tenor)
+        result["tenor_days"] = result["tenor"].map(tenor_to_days)
+        result["source"] = "Live BQL"
+        result = result.dropna(subset=["tenor", "tenor_days", "par_rate"])
+        result = result.sort_values("tenor_days").reset_index(drop=True)
+
+        minimum = max(3, len(config.calibration_tenors))
+        if len(result) < minimum:
+            raise RuntimeError(
+                f"BQL returned {len(result)} points; at least {minimum} are required."
+            )
+        return result
+
+    @staticmethod
+    def live_policy_rate(config: CountryConfig, service=None) -> float:
+        if not config.policy_ticker:
+            return config.policy_rate
+        if bql is None:
+            raise RuntimeError("BQL is unavailable in this environment.")
+
+        service = service or bql.Service()
+        request = bql.Request(
+            [config.policy_ticker],
+            {"policy": service.data.px_last()},
+        )
+        raw = service.execute(request)[0].df().reset_index()
+        value_col = "policy" if "policy" in raw.columns else raw.columns[-1]
+        value = pd.to_numeric(raw[value_col], errors="coerce").iloc[0]
+        if pd.isna(value):
+            raise RuntimeError("Policy ticker returned a non-numeric value.")
+        return float(value)
+
+
+# =============================================================================
+# 2. SHORT-RATE CURVE
+# =============================================================================
+
+@dataclass(frozen=True)
+class CurveSettings:
+    day_count_basis: int
+    spot_lag_days: int
+
+
+class ShortRateCurve:
+    """
+    Short-dated spot-starting OIS/RFR curve.
+
+    For the <=1Y prototype, each market quote is represented as a single-payment
+    par instrument:
+
+        DF(spot, maturity) = 1 / (1 + S * alpha)
+
+    PCHIP is applied to log discount factors to preserve positivity and avoid
+    the oscillation that a high-order spline can create at the short end.
+    """
+
+    @staticmethod
+    def build(
+        quotes: pd.DataFrame,
+        effective_overnight_rate: float,
+        settings: CurveSettings,
+    ):
+        curve = quotes.copy().sort_values("tenor_days").reset_index(drop=True)
+        curve["par_rate"] = pd.to_numeric(curve["par_rate"], errors="coerce")
+        curve["tenor_days"] = pd.to_numeric(curve["tenor_days"], errors="coerce")
+        curve = curve.dropna(subset=["par_rate", "tenor_days"])
+        curve = curve[curve["tenor_days"] > 0].drop_duplicates(
+            "tenor_days", keep="last"
+        )
+
+        if len(curve) < 3:
+            raise ValueError("At least three valid curve quotes are required.")
+
+        spot = settings.spot_lag_days
+        curve["start_day"] = spot
+        curve["end_day"] = spot + curve["tenor_days"].astype(int)
+
+        df_spot = (
+            1.0 + effective_overnight_rate / 100.0 / settings.day_count_basis
+        ) ** (-spot)
+
+        alpha = curve["tenor_days"].to_numpy(float) / settings.day_count_basis
+        rates = curve["par_rate"].to_numpy(float) / 100.0
+        forward_df = 1.0 / (1.0 + rates * alpha)
+
+        curve["discount_factor"] = df_spot * forward_df
+        curve["log_discount_factor"] = np.log(curve["discount_factor"])
+
+        if spot > 0:
+            node_days = np.r_[
+                0.0,
+                float(spot),
+                curve["end_day"].to_numpy(float),
+            ]
+            node_logdfs = np.r_[
+                0.0,
+                np.log(df_spot),
+                curve["log_discount_factor"].to_numpy(float),
+            ]
+        else:
+            node_days = np.r_[0.0, curve["end_day"].to_numpy(float)]
+            node_logdfs = np.r_[
+                0.0,
+                curve["log_discount_factor"].to_numpy(float),
+            ]
+
+        logdf_fn = PchipInterpolator(node_days, node_logdfs, extrapolate=False)
+        return curve, logdf_fn
+
+    @staticmethod
+    def discount_factor(logdf_fn, day: int) -> float:
+        if day <= 0:
+            return 1.0
+        value = float(logdf_fn(float(day)))
+        if not np.isfinite(value):
+            raise ValueError(f"Day {day} is outside the calibrated curve.")
+        return float(np.exp(value))
+
+    @staticmethod
+    def forward_discount_factor(logdf_fn, start_day: int, end_day: int) -> float:
+        return (
+            ShortRateCurve.discount_factor(logdf_fn, end_day)
+            / ShortRateCurve.discount_factor(logdf_fn, start_day)
+        )
+
+    @staticmethod
+    def spot_par_rate(logdf_fn, tenor_days: int, settings: CurveSettings) -> float:
+        start = settings.spot_lag_days
+        end = start + int(tenor_days)
+        ratio = ShortRateCurve.forward_discount_factor(logdf_fn, start, end)
+        alpha = tenor_days / settings.day_count_basis
+        return ((1.0 / ratio - 1.0) / alpha) * 100.0
+
+    @staticmethod
+    def rolling_forward_curve(
+        logdf_fn,
+        window_days: int,
+        max_calendar_day: int,
+        settings: CurveSettings,
+    ) -> pd.DataFrame:
+        max_end = settings.spot_lag_days + max_calendar_day
+        starts = np.arange(
+            settings.spot_lag_days,
+            max_end - window_days + 1,
+        )
+        rates = []
+        for start in starts:
+            end = start + window_days
+            ratio = ShortRateCurve.forward_discount_factor(
+                logdf_fn, int(start), int(end)
+            )
+            rate = (
+                (1.0 / ratio) ** (settings.day_count_basis / window_days) - 1.0
+            ) * 100.0
+            rates.append(rate)
+        return pd.DataFrame({
+            "start_day": starts,
+            "forward_rate": rates,
+        })
+
+
+# =============================================================================
+# 3. POLICY-PATH ENGINE
+# =============================================================================
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import least_squares
+
+@dataclass(frozen=True)
+class CalibrationSettings:
+    smoothness_lambda: float = 0.10
+    move_size_lambda: float = 0.02
+    front_load_lambda: float = 0.0
+    back_load_lambda: float = 0.0
+    standard_move_lambda: float = 0.0
+
+
+CALIBRATION_PROFILES = {
+    "Balanced": CalibrationSettings(
+        smoothness_lambda=0.10,
+        move_size_lambda=0.02,
+    ),
+    "Smooth": CalibrationSettings(
+        smoothness_lambda=0.45,
+        move_size_lambda=0.04,
+    ),
+    "Front-loaded": CalibrationSettings(
+        smoothness_lambda=0.12,
+        move_size_lambda=0.02,
+        front_load_lambda=0.10,
+    ),
+    "Back-loaded": CalibrationSettings(
+        smoothness_lambda=0.12,
+        move_size_lambda=0.02,
+        back_load_lambda=0.10,
+    ),
+    "Standard-move regularized": CalibrationSettings(
+        smoothness_lambda=0.18,
+        move_size_lambda=0.02,
+        standard_move_lambda=0.08,
+    ),
+}
+
+
+class PolicyPathEngine:
+    @staticmethod
+    def boundary_days(config: CountryConfig, max_curve_day: int) -> np.ndarray:
+        meeting_days = [
+            max((date - config.as_of_date).days, 0)
+            for date in config.meeting_dates
+        ]
+        terminal = max(max_curve_day + config.spot_lag_days + 2, meeting_days[-1] + 32)
+        return np.asarray([0] + meeting_days + [terminal], dtype=int)
+
+    @staticmethod
+    def accumulation(
+        target_day: int,
+        boundaries: np.ndarray,
+        rates_pct: np.ndarray,
+        config: CountryConfig,
+    ) -> float:
+        value = 1.0
+        for i, rate in enumerate(rates_pct):
+            start, end = int(boundaries[i]), int(boundaries[i + 1])
+            overlap = max(min(int(target_day), end) - start, 0)
+            if overlap > 0:
+                value *= (
+                    1.0 + float(rate) / 100.0 / config.day_count_basis
+                ) ** overlap
+            if target_day <= end:
+                break
+        return value
+
+    @staticmethod
+    def forward_df(
+        start_day: int,
+        end_day: int,
+        boundaries: np.ndarray,
+        rates_pct: np.ndarray,
+        config: CountryConfig,
+    ) -> float:
+        return (
+            PolicyPathEngine.accumulation(start_day, boundaries, rates_pct, config)
+            / PolicyPathEngine.accumulation(end_day, boundaries, rates_pct, config)
+        )
+
+    @staticmethod
+    def par_rate(
+        tenor_days: int,
+        boundaries: np.ndarray,
+        rates_pct: np.ndarray,
+        config: CountryConfig,
+    ) -> float:
+        start = config.spot_lag_days
+        end = start + int(tenor_days)
+        df = PolicyPathEngine.forward_df(start, end, boundaries, rates_pct, config)
+        alpha = tenor_days / config.day_count_basis
+        return ((1.0 / df - 1.0) / alpha) * 100.0
+
+    @staticmethod
+    def calibrate(
+        config: CountryConfig,
+        curve: pd.DataFrame,
+        settings: CalibrationSettings = CalibrationSettings(),
+    ):
+        calibration = curve[curve["tenor"].isin(config.calibration_tenors)].copy()
+        validation = curve[curve["tenor"].isin(config.validation_tenors)].copy()
+        n_meetings = len(config.meeting_dates)
+        boundaries = PolicyPathEngine.boundary_days(
+            config,
+            int(curve["tenor_days"].max()),
+        )
+
+        weights = 1.0 / np.sqrt(
+            np.maximum(calibration["tenor_days"].to_numpy(float), 7.0) / 7.0
+        )
+
+        longest_rate = float(calibration.sort_values("tenor_days").iloc[-1]["par_rate"])
+        approximate_total_move = (
+            longest_rate - config.effective_overnight_rate
+        ) * 100.0
+        initial_moves = np.repeat(
+            np.clip(
+                approximate_total_move / max(n_meetings, 1),
+                config.move_lower_bound_bps,
+                config.move_upper_bound_bps,
+            ),
+            n_meetings,
+        )
+
+        def rates_from_moves(move_bps: np.ndarray) -> np.ndarray:
+            policy_after = config.policy_rate + np.cumsum(move_bps) / 100.0
+            overnight_after = (
+                policy_after + config.overnight_policy_basis_bps / 100.0
+            )
+            return np.r_[config.effective_overnight_rate, overnight_after]
+
+        def residuals(move_bps: np.ndarray) -> np.ndarray:
+            rates = rates_from_moves(move_bps)
+            errors = []
+            for (_, row), weight in zip(calibration.iterrows(), weights):
+                model = PolicyPathEngine.par_rate(
+                    int(row["tenor_days"]),
+                    boundaries,
+                    rates,
+                    config,
+                )
+                errors.append((model - float(row["par_rate"])) * 100.0 * weight)
+
+            smooth_penalty = (
+                np.sqrt(settings.smoothness_lambda)
+                * np.diff(move_bps)
+                / config.standard_move_bps
+            )
+            size_penalty = (
+                np.sqrt(settings.move_size_lambda)
+                * move_bps
+                / config.standard_move_bps
+            )
+
+            # Country desks often prefer a transparent allocation convention
+            # when several meeting paths fit the same short curve.
+            front_weights = np.arange(n_meetings, dtype=float)
+            back_weights = front_weights[::-1]
+            front_penalty = (
+                np.sqrt(settings.front_load_lambda)
+                * front_weights
+                * move_bps
+                / config.standard_move_bps
+            )
+            back_penalty = (
+                np.sqrt(settings.back_load_lambda)
+                * back_weights
+                * move_bps
+                / config.standard_move_bps
+            )
+
+            # Softly prefer increments near whole standard-move units without
+            # forcing discrete moves or creating a non-smooth optimizer.
+            standard_units = move_bps / config.standard_move_bps
+            standard_move_penalty = (
+                np.sqrt(settings.standard_move_lambda)
+                * np.sin(np.pi * standard_units)
+            )
+
+            return np.r_[
+                errors,
+                smooth_penalty,
+                size_penalty,
+                front_penalty,
+                back_penalty,
+                standard_move_penalty,
+            ]
+
+        result = least_squares(
+            residuals,
+            initial_moves,
+            bounds=(
+                np.full(n_meetings, config.move_lower_bound_bps),
+                np.full(n_meetings, config.move_upper_bound_bps),
+            ),
+            xtol=1e-11,
+            ftol=1e-11,
+            gtol=1e-11,
+            max_nfev=20000,
+        )
+        if not result.success:
+            raise RuntimeError(f"Calibration failed: {result.message}")
+
+        moves = result.x
+        rates = rates_from_moves(moves)
+        policy_after = config.policy_rate + np.cumsum(moves) / 100.0
+
+        confidence = []
+        for i in range(n_meetings):
+            if i == 0:
+                confidence.append("Higher")
+            elif i == n_meetings - 1:
+                confidence.append("Lower")
+            else:
+                confidence.append("Medium")
+
+        path = pd.DataFrame({
+            "meeting_date": config.meeting_dates,
+            "move_bps_raw": moves,
+            "move_bps_rounded": (
+                np.round(moves / config.standard_move_bps)
+                * config.standard_move_bps
+            ),
+            "post_policy_rate": policy_after,
+            "post_overnight_rate": rates[1:],
+            "confidence": confidence,
+        })
+
+        diagnostics = []
+        for _, row in pd.concat([calibration, validation]).iterrows():
+            model = PolicyPathEngine.par_rate(
+                int(row["tenor_days"]),
+                boundaries,
+                rates,
+                config,
+            )
+            diagnostics.append({
+                "tenor": row["tenor"],
+                "use": (
+                    "Calibration"
+                    if row["tenor"] in config.calibration_tenors
+                    else "Validation"
+                ),
+                "market_rate": float(row["par_rate"]),
+                "model_rate": model,
+                "error_bps": (model - float(row["par_rate"])) * 100.0,
+            })
+        diagnostics = pd.DataFrame(diagnostics)
+        calibration_errors = diagnostics.loc[
+            diagnostics["use"] == "Calibration", "error_bps"
+        ].to_numpy(float)
+        metrics = {
+            "rmse_bps": float(np.sqrt(np.mean(calibration_errors ** 2))),
+            "max_abs_error_bps": float(np.max(np.abs(calibration_errors))),
+            "success": bool(result.success),
+        }
+        return path, diagnostics, metrics, boundaries, rates
+
+    @staticmethod
+    def scenario_path(
+        config: CountryConfig,
+        market_path: pd.DataFrame,
+        user_moves_bps,
+    ) -> pd.DataFrame:
+        if len(user_moves_bps) != len(market_path):
+            raise ValueError("Enter one move per meeting.")
+        scenario = market_path.copy()
+        scenario["user_move_bps"] = [float(x) for x in user_moves_bps]
+        scenario["user_policy_rate"] = (
+            config.policy_rate + scenario["user_move_bps"].cumsum() / 100.0
+        )
+        scenario["user_overnight_rate"] = (
+            scenario["user_policy_rate"]
+            + config.overnight_policy_basis_bps / 100.0
+        )
+        scenario["user_minus_market_bps"] = (
+            scenario["user_policy_rate"] - scenario["post_policy_rate"]
+        ) * 100.0
+        return scenario
+
+    @staticmethod
+    def selected_trade(
+        config: CountryConfig,
+        logdf_fn,
+        tenor_days: int,
+        boundaries: np.ndarray,
+        scenario_rates: np.ndarray,
+        notional: float,
+        direction: str,
+    ) -> pd.DataFrame:
+        curve_settings = CurveSettings(
+            config.day_count_basis,
+            config.spot_lag_days,
+        )
+        market_rate = ShortRateCurve.spot_par_rate(
+            logdf_fn, tenor_days, curve_settings
+        )
+        scenario_rate = PolicyPathEngine.par_rate(
+            tenor_days, boundaries, scenario_rates, config
+        )
+
+        start = config.spot_lag_days
+        end = start + int(tenor_days)
+        scenario_df = PolicyPathEngine.forward_df(
+            start, end, boundaries, scenario_rates, config
+        )
+        alpha = tenor_days / config.day_count_basis
+
+        fixed_pv = market_rate / 100.0 * alpha * scenario_df * notional
+        floating_pv = (1.0 - scenario_df) * notional
+        payer_pv = floating_pv - fixed_pv
+        position_pv = payer_pv if direction == "Pay fixed" else -payer_pv
+        dv01 = alpha * scenario_df * notional / 10000.0
+        gap_bps = (scenario_rate - market_rate) * 100.0
+
+        return pd.DataFrame([{
+            "market_rate_pct": market_rate,
+            "scenario_fair_rate_pct": scenario_rate,
+            "scenario_minus_market_bps": gap_bps,
+            "direction": direction,
+            "notional": notional,
+            "dv01_per_bp": dv01,
+            "scenario_pv": position_pv,
+            "trade_signal": (
+                "Pay fixed" if gap_bps > 1.0
+                else "Receive fixed" if gap_bps < -1.0
+                else "Near fair"
+            ),
+        }])
+
+
+# =============================================================================
+# 4. INTERACTIVE DASHBOARD
+# =============================================================================
+
+from dataclasses import replace
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import HTML, Markdown, clear_output, display
+
+class GlobalEMPolicyPricer:
+    """
+    Global EM meeting-path and scenario pricer.
+
+    Tabs
+    ----
+    Overview:
+        Bloomberg/WIPR-style meeting path, incremental meeting pricing,
+        summary cards and concise meeting table.
+    Scenario:
+        User meeting path, selected trade valuation and rich/cheap by tenor.
+    Diagnostics:
+        Observed curve versus model reconstruction, residuals and WIPR
+        benchmark comparison where available.
+    Settings:
+        Country conventions, curve choice, tickers and assumptions.
+    """
+
+    def __init__(self):
+        self.base_config = COUNTRIES["Turkey"]
+        self.config = self.base_config
+
+        self.quotes = None
+        self.curve = None
+        self.logdf = None
+        self.path = None
+        self.diagnostics = None
+        self.metrics = None
+        self.boundaries = None
+        self.market_rates = None
+        self.scenario = None
+        self.trade = None
+        self.move_widgets = []
+
+        self._build_static_widgets()
+        self._build_country_widgets()
+        self._build_layout()
+
+    # ------------------------------------------------------------------
+    # Widget construction
+    # ------------------------------------------------------------------
+    def _build_static_widgets(self):
+        self.country = widgets.Dropdown(
+            options=list(COUNTRIES),
+            value="Turkey",
+            description="Country:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.data_source = widgets.ToggleButtons(
+            options=["Snapshot", "Live BQL"],
+            value="Snapshot",
+            description="Data:",
+        )
+        self.path_view = widgets.ToggleButtons(
+            options=["Effective O/N", "Policy-equivalent"],
+            value="Effective O/N",
+            description="View:",
+        )
+        self.show_forward = widgets.Checkbox(
+            value=False,
+            description="Show smoothed OIS forward",
+            indent=False,
+        )
+        self.calibration_method = widgets.Dropdown(
+            options=list(CALIBRATION_PROFILES),
+            value="Balanced",
+            description="Allocation:",
+            layout=widgets.Layout(width="255px"),
+        )
+
+        self.refresh = widgets.Button(
+            description="Refresh market",
+            button_style="info",
+            icon="refresh",
+        )
+        self.reset = widgets.Button(
+            description="Reset to market",
+            icon="undo",
+        )
+        self.run_scenario = widgets.Button(
+            description="Run scenario",
+            button_style="success",
+            icon="play",
+        )
+
+        self.header_out = widgets.Output()
+        self.overview_out = widgets.Output()
+        self.scenario_controls_out = widgets.Output()
+        self.scenario_out = widgets.Output()
+        self.diagnostics_out = widgets.Output()
+        self.settings_out = widgets.Output()
+
+        self.country.observe(self._country_changed, names="value")
+        self.path_view.observe(lambda _: self.render_overview(), names="value")
+        self.show_forward.observe(lambda _: self.render_overview(), names="value")
+        self.calibration_method.observe(
+            lambda _: self.run(refresh=True), names="value"
+        )
+        self.refresh.on_click(lambda _: self.run(refresh=True))
+        self.reset.on_click(lambda _: self.reset_to_market())
+        self.run_scenario.on_click(lambda _: self.run(refresh=False))
+
+    def _build_country_widgets(self):
+        c = self.base_config
+        self.policy_rate = widgets.FloatText(
+            value=c.policy_rate,
+            description="Policy:",
+            layout=widgets.Layout(width="195px"),
+        )
+        self.overnight = widgets.FloatText(
+            value=c.effective_overnight_rate,
+            description="Effective O/N:",
+            layout=widgets.Layout(width="235px"),
+        )
+        self.basis = widgets.FloatText(
+            value=c.overnight_policy_basis_bps,
+            description="O/N-policy bp:",
+            layout=widgets.Layout(width="235px"),
+        )
+        self.trade_tenor = widgets.Dropdown(
+            options=list(c.trade_tenors),
+            value=c.trade_tenors[-1],
+            description="Tenor:",
+            layout=widgets.Layout(width="180px"),
+        )
+        self.direction = widgets.Dropdown(
+            options=["Pay fixed", "Receive fixed"],
+            value="Pay fixed",
+            description="Direction:",
+            layout=widgets.Layout(width="220px"),
+        )
+        self.notional = widgets.FloatText(
+            value=100_000_000.0,
+            description=f"Notional {c.currency}:",
+            layout=widgets.Layout(width="285px"),
+        )
+
+    def _build_layout(self):
+        self.top_controls = widgets.VBox([
+            widgets.HBox([
+                self.country,
+                self.data_source,
+                self.path_view,
+                self.show_forward,
+                self.calibration_method,
+                self.refresh,
+            ]),
+            widgets.HBox([
+                self.policy_rate,
+                self.overnight,
+                self.basis,
+            ]),
+        ])
+
+        self.overview_tab = widgets.VBox([
+            self.header_out,
+            self.overview_out,
+        ])
+        self.scenario_tab = widgets.VBox([
+            self.scenario_controls_out,
+            self.scenario_out,
+        ])
+        self.diagnostics_tab = widgets.VBox([self.diagnostics_out])
+        self.settings_tab = widgets.VBox([self.settings_out])
+
+        self.tabs = widgets.Tab(children=[
+            self.overview_tab,
+            self.scenario_tab,
+            self.diagnostics_tab,
+            self.settings_tab,
+        ])
+        self.tabs.set_title(0, "Overview")
+        self.tabs.set_title(1, "Scenario")
+        self.tabs.set_title(2, "Diagnostics")
+        self.tabs.set_title(3, "Settings")
+
+    # ------------------------------------------------------------------
+    # State management
+    # ------------------------------------------------------------------
+    def _country_changed(self, change):
+        self.base_config = COUNTRIES[change["new"]]
+        c = self.base_config
+
+        self.policy_rate.value = c.policy_rate
+        self.overnight.value = c.effective_overnight_rate
+        self.basis.value = c.overnight_policy_basis_bps
+        self.trade_tenor.options = list(c.trade_tenors)
+        self.trade_tenor.value = c.trade_tenors[-1]
+        self.notional.description = f"Notional {c.currency}:"
+
+        # Countries whose curve is only wired up as a live BQL curve object
+        # (no offline quotes snapshot) should default straight to Live BQL,
+        # otherwise Refresh would just hit the "no snapshot" error.
+        if not c.quotes and c.curve_ticker:
+            self.data_source.value = "Live BQL"
+
+        self.quotes = None
+        self.run(refresh=True)
+
+    def _editable_config(self):
+        return replace(
+            self.base_config,
+            policy_rate=float(self.policy_rate.value),
+            effective_overnight_rate=float(self.overnight.value),
+            overnight_policy_basis_bps=float(self.basis.value),
+        )
+
+    def _load_market(self):
+        c = self.config
+        if self.data_source.value == "Live BQL":
+            self.quotes = MarketData.live_curve(c)
+            self.policy_rate.value = MarketData.live_policy_rate(c)
+            self.config = self._editable_config()
+        else:
+            self.quotes = MarketData.snapshot(c)
+
+    def _build_scenario_controls(self):
+        self.move_widgets = [
+            widgets.FloatText(
+                value=float(move),
+                description=date.strftime("%d %b %Y"),
+                layout=widgets.Layout(width="245px"),
+            )
+            for date, move in zip(
+                self.path["meeting_date"],
+                self.path["move_bps_raw"],
+            )
+        ]
+
+        with self.scenario_controls_out:
+            clear_output()
+            display(HTML("""
+            <h3>Enter your central-bank scenario</h3>
+            <div style="color:#aaa;margin-top:-8px;margin-bottom:9px;">
+              Enter the incremental move at each meeting in basis points.
+              Negative = cut; positive = hike. “Reset to market” restores the
+              exact calibrated moves, not rounded approximations.
+            </div>
+            """))
+            display(widgets.GridBox(
+                children=self.move_widgets,
+                layout=widgets.Layout(
+                    grid_template_columns="repeat(2, 260px)",
+                    grid_gap="5px 20px",
+                ),
+            ))
+            display(widgets.HBox([
+                self.trade_tenor,
+                self.direction,
+                self.notional,
+                self.reset,
+                self.run_scenario,
+            ]))
+
+    def _user_moves(self):
+        return [float(widget.value) for widget in self.move_widgets]
+
+    def reset_to_market(self):
+        if self.path is None or not self.move_widgets:
+            return
+        for widget, move in zip(
+            self.move_widgets,
+            self.path["move_bps_raw"],
+        ):
+            widget.value = float(move)
+        self.run(refresh=False)
+
+    # ------------------------------------------------------------------
+    # Model run
+    # ------------------------------------------------------------------
+    def run(self, refresh=False):
+        with self.header_out:
+            clear_output()
+            display(HTML("<b>Loading market and calibrating...</b>"))
+
+        try:
+            self.config = self._editable_config()
+            c = self.config
+
+            if refresh or self.quotes is None:
+                self._load_market()
+                self.config = self._editable_config()
+                c = self.config
+
+                curve_settings = CurveSettings(
+                    c.day_count_basis,
+                    c.spot_lag_days,
+                )
+                self.curve, self.logdf = ShortRateCurve.build(
+                    self.quotes,
+                    c.effective_overnight_rate,
+                    curve_settings,
+                )
+                (
+                    self.path,
+                    self.diagnostics,
+                    self.metrics,
+                    self.boundaries,
+                    self.market_rates,
+                ) = PolicyPathEngine.calibrate(
+                    c,
+                    self.curve,
+                    CALIBRATION_PROFILES[self.calibration_method.value],
+                )
+                self._build_scenario_controls()
+
+            self.scenario = PolicyPathEngine.scenario_path(
+                c,
+                self.path,
+                self._user_moves(),
+            )
+            scenario_rates = np.r_[
+                c.effective_overnight_rate,
+                self.scenario["user_overnight_rate"].to_numpy(float),
+            ]
+            self.trade = PolicyPathEngine.selected_trade(
+                c,
+                self.logdf,
+                TENOR_DAYS[self.trade_tenor.value],
+                self.boundaries,
+                scenario_rates,
+                float(self.notional.value),
+                self.direction.value,
+            )
+
+            self.render_header()
+            self.render_overview()
+            self.render_scenario()
+            self.render_diagnostics()
+            self.render_settings()
+
+        except Exception:
+            import traceback
+            with self.header_out:
+                clear_output()
+                display(HTML(
+                    "<h3 style='color:#b00020'>Dashboard error</h3>"
+                    f"<pre>{traceback.format_exc()}</pre>"
+                ))
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _confidence_label(move_bps: float, standard_move_bps: float) -> str:
+        """
+        Heuristic only: proximity to the nearest whole standard move.
+        This is not statistical confidence.
+        """
+        if standard_move_bps <= 0:
+            return "N/A"
+        units = abs(move_bps) / standard_move_bps
+        distance = abs(units - round(units))
+        if distance <= 0.10:
+            return "High"
+        if distance <= 0.25:
+            return "Moderate"
+        return "Low"
+
+    @staticmethod
+    def _confidence_badge(label: str) -> str:
+        palette = {
+            "High": ("#14532d", "#dcfce7"),
+            "Moderate": ("#713f12", "#fef3c7"),
+            "Low": ("#7f1d1d", "#fee2e2"),
+            "N/A": ("#374151", "#e5e7eb"),
+        }
+        background, foreground = palette[label]
+        return (
+            f"<span style='background:{background};color:{foreground};"
+            "padding:3px 8px;border-radius:10px;font-size:11px;'>"
+            f"{label}</span>"
+        )
+
+    def _step_coordinates(self, level_column: str):
+        c = self.config
+        if level_column == "post_overnight_rate":
+            current = c.effective_overnight_rate
+        else:
+            current = c.policy_rate
+
+        meeting_dates = self.path["meeting_date"].tolist()
+        new_levels = self.path[level_column].to_numpy(float)
+        chart_end = meeting_dates[-1] + pd.Timedelta(days=28)
+
+        x = [c.as_of_date]
+        y = [current]
+        previous = current
+
+        for meeting_date, new_level in zip(meeting_dates, new_levels):
+            # Horizontal segment up to the meeting, then a vertical jump at
+            # that exact timestamp. Bars use the same meeting_date values.
+            x.extend([meeting_date, meeting_date])
+            y.extend([previous, float(new_level)])
+            previous = float(new_level)
+
+        x.append(chart_end)
+        y.append(previous)
+        return x, y, meeting_dates, new_levels, chart_end
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+    def render_header(self):
+        c = self.config
+        first = self.path.iloc[0]
+        total_priced = float(self.path["move_bps_raw"].sum())
+
+        cards = [
+            ("CURRENT POLICY", f"{c.policy_rate:.3f}%"),
+            ("CURRENT EFFECTIVE O/N", f"{c.effective_overnight_rate:.3f}%"),
+            (
+                "NEXT MEETING",
+                f"{first['move_bps_raw']:+.1f} bp",
+                str(first["meeting_date"].date()),
+            ),
+            (
+                "TOTAL PRICED",
+                f"{total_priced:+.1f} bp",
+                "through last loaded meeting",
+            ),
+            ("FIT RMSE", f"{self.metrics['rmse_bps']:.2f} bp"),
+        ]
+
+        card_html = ""
+        for card in cards:
+            title, value = card[0], card[1]
+            subtitle = card[2] if len(card) > 2 else ""
+            card_html += f"""
+            <div style="
+                border:1px solid #444;
+                border-radius:8px;
+                padding:11px 13px;
+                min-width:170px;
+                flex:1;
+            ">
+              <div style="color:#aaa;font-size:11px;">{title}</div>
+              <div style="font-size:21px;font-weight:700;margin-top:2px;">
+                {value}
+              </div>
+              <div style="color:#888;font-size:11px;">{subtitle}</div>
+            </div>
+            """
+
+        with self.header_out:
+            clear_output()
+            display(HTML(f"""
+            <div style="
+                border:1px solid #555;
+                border-radius:10px;
+                padding:15px 18px;
+                margin:5px 0 12px;
+            ">
+              <div style="font-size:25px;font-weight:700;">
+                Global EM Implied Monetary Policy Pricer
+              </div>
+              <div style="color:#aaa;margin-top:4px;">
+                {c.name} · {c.curve_name} · As of {c.as_of_date.date()}
+              </div>
+              <div style="
+                  display:flex;
+                  flex-wrap:wrap;
+                  gap:9px;
+                  margin-top:14px;
+              ">
+                {card_html}
+              </div>
+            </div>
+            """))
+
+    # ------------------------------------------------------------------
+    # Overview
+    # ------------------------------------------------------------------
+    def render_overview(self):
+        if self.path is None:
+            return
+
+        c = self.config
+
+        if self.path_view.value == "Effective O/N":
+            level_column = "post_overnight_rate"
+            y_title = "Implied overnight policy path (%)"
+            step_name = "Implied overnight policy path"
+            forward_adjustment = 0.0
+        else:
+            level_column = "post_policy_rate"
+            y_title = "Policy-equivalent rate (%)"
+            step_name = "Implied policy-equivalent path"
+            forward_adjustment = c.overnight_policy_basis_bps / 100.0
+
+        step_x, step_y, meeting_dates, new_levels, chart_end = (
+            self._step_coordinates(level_column)
+        )
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Blue staircase: cumulative post-meeting level.
+        fig.add_trace(go.Scatter(
+            x=step_x,
+            y=step_y,
+            mode="lines",
+            name=step_name,
+            line={"width": 3, "color": "#38bdf8"},
+            hovertemplate="%{x|%d %b %Y}<br>%{y:.4f}%<extra></extra>",
+        ), secondary_y=False)
+
+        fig.add_trace(go.Scatter(
+            x=meeting_dates,
+            y=new_levels,
+            mode="markers",
+            name="Post-meeting level",
+            marker={"size": 8, "color": "#38bdf8"},
+            showlegend=False,
+            hovertemplate="%{x|%d %b %Y}<br>%{y:.4f}%<extra></extra>",
+        ), secondary_y=False)
+
+        # Optional yellow dotted market-forward diagnostic.
+        if self.show_forward.value:
+            curve_settings = CurveSettings(
+                c.day_count_basis,
+                c.spot_lag_days,
+            )
+            final_day = min(
+                int(self.curve["tenor_days"].max()) - 7,
+                (chart_end - c.as_of_date).days,
+            )
+            if final_day >= 14:
+                forward = ShortRateCurve.rolling_forward_curve(
+                    self.logdf,
+                    window_days=7,
+                    max_calendar_day=final_day,
+                    settings=curve_settings,
+                )
+                forward_dates = [
+                    c.as_of_date + pd.Timedelta(days=int(day))
+                    for day in forward["start_day"]
+                ]
+                forward_values = (
+                    forward["forward_rate"].to_numpy(float)
+                    - forward_adjustment
+                )
+                fig.add_trace(go.Scatter(
+                    x=forward_dates,
+                    y=forward_values,
+                    mode="lines",
+                    name="Smoothed OIS forward",
+                    line={
+                        "width": 2,
+                        "dash": "dot",
+                        "color": "#facc15",
+                    },
+                ), secondary_y=False)
+
+        # Green = cuts, red = hikes. Bars and step jumps share meeting_dates.
+        bar_colors = [
+            "#22c55e" if value < 0 else "#ef4444"
+            for value in self.path["move_bps_raw"]
+        ]
+        fig.add_trace(go.Bar(
+            x=meeting_dates,
+            y=self.path["move_bps_raw"],
+            marker_color=bar_colors,
+            opacity=0.32,
+            name="Incremental meeting pricing",
+            text=[
+                f"{value:+.1f} bp"
+                for value in self.path["move_bps_raw"]
+            ],
+            textposition="outside",
+            hovertemplate=(
+                "%{x|%d %b %Y}<br>"
+                "Incremental pricing: %{y:+.2f} bp<extra></extra>"
+            ),
+        ), secondary_y=True)
+
+        fig.update_yaxes(
+            title_text=y_title,
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title_text="Incremental meeting pricing (bp)",
+            secondary_y=True,
+            zeroline=True,
+        )
+        fig.update_layout(
+            title=f"{c.name}: market-implied central-bank path",
+            xaxis_title="Meeting date",
+            height=570,
+            template="plotly_dark",
+            hovermode="x unified",
+            legend={"orientation": "h", "y": -0.17},
+            margin={"l": 80, "r": 95, "t": 75, "b": 105},
+            barmode="overlay",
+        )
+
+        scenario_values = (
+            self.scenario["user_move_bps"].to_numpy(float)
+            if self.scenario is not None
+            else self.path["move_bps_raw"].to_numpy(float)
+        )
+
+        table = pd.DataFrame({
+            "Meeting": self.path["meeting_date"].dt.date,
+            "Market move (bp)": self.path["move_bps_raw"],
+            "Post-meeting rate (%)": (
+                self.path["post_overnight_rate"]
+                if self.path_view.value == "Effective O/N"
+                else self.path["post_policy_rate"]
+            ),
+            "Trader scenario (bp)": scenario_values,
+        })
+
+        confidence = [
+            self._confidence_label(value, c.standard_move_bps)
+            for value in self.path["move_bps_raw"]
+        ]
+
+        with self.overview_out:
+            clear_output()
+            fig.show()
+            display(HTML("""
+            <div style="color:#aaa;font-size:12px;margin:-3px 0 13px;">
+              Blue shows the cumulative post-meeting rate. Green/red bars show
+              only the incremental pricing at each meeting. A bar and its
+              vertical step are anchored to the same meeting timestamp, but
+              they use different axes: percent on the left and basis points
+              on the right. The yellow dotted line, when enabled, is a smooth
+              market-forward diagnostic rather than a continuously changing
+              policy assumption.
+            </div>
+            <h3>Meeting-by-Meeting Pricing</h3>
+            """))
+
+            # Concise desk table plus transparent heuristic confidence badges.
+            formatted = table.copy()
+            formatted["Market move (bp)"] = formatted[
+                "Market move (bp)"
+            ].map(lambda x: f"{x:+.1f}")
+            formatted["Post-meeting rate (%)"] = formatted[
+                "Post-meeting rate (%)"
+            ].map(lambda x: f"{x:.3f}")
+            formatted["Trader scenario (bp)"] = formatted[
+                "Trader scenario (bp)"
+            ].map(lambda x: f"{x:+.1f}")
+            formatted["Move confidence*"] = [
+                self._confidence_badge(label)
+                for label in confidence
+            ]
+
+            display(HTML(
+                formatted.to_html(
+                    index=False,
+                    escape=False,
+                    border=0,
+                    classes="dataframe",
+                )
+            ))
+            display(HTML("""
+            <div style="color:#888;font-size:11px;margin-top:5px;">
+              *Heuristic only: proximity to a whole standard policy move.
+              It is not a statistical confidence interval.
+            </div>
+            """))
+
+    # ------------------------------------------------------------------
+    # Scenario
+    # ------------------------------------------------------------------
+    def render_scenario(self):
+        c = self.config
+        scenario_rates = np.r_[
+            c.effective_overnight_rate,
+            self.scenario["user_overnight_rate"].to_numpy(float),
+        ]
+
+        repricing_rows = []
+        for tenor in c.trade_tenors:
+            days = TENOR_DAYS[tenor]
+            market_rate = ShortRateCurve.spot_par_rate(
+                self.logdf,
+                days,
+                CurveSettings(c.day_count_basis, c.spot_lag_days),
+            )
+            scenario_rate = PolicyPathEngine.par_rate(
+                days,
+                self.boundaries,
+                scenario_rates,
+                c,
+            )
+            repricing_rows.append({
+                "tenor": tenor,
+                "market_rate": market_rate,
+                "scenario_rate": scenario_rate,
+                "gap_bps": (scenario_rate - market_rate) * 100.0,
+            })
+
+        repricing = pd.DataFrame(repricing_rows)
+
+        market_x = [c.as_of_date] + self.path["meeting_date"].tolist()
+        market_y = [c.effective_overnight_rate] + self.path[
+            "post_overnight_rate"
+        ].tolist()
+        scenario_x = [c.as_of_date] + self.scenario[
+            "meeting_date"
+        ].tolist()
+        scenario_y = [c.effective_overnight_rate] + self.scenario[
+            "user_overnight_rate"
+        ].tolist()
+
+        path_fig = go.Figure()
+        path_fig.add_trace(go.Scatter(
+            x=market_x,
+            y=market_y,
+            mode="lines+markers",
+            line_shape="hv",
+            name="Market path",
+            line={"width": 3, "color": "#38bdf8"},
+        ))
+        path_fig.add_trace(go.Scatter(
+            x=scenario_x,
+            y=scenario_y,
+            mode="lines+markers",
+            line_shape="hv",
+            name="Trader scenario",
+            line={"width": 3, "color": "#f97316"},
+        ))
+        path_fig.update_layout(
+            title="Market path versus trader scenario",
+            xaxis_title="Meeting date",
+            yaxis_title="Effective O/N (%)",
+            height=430,
+            template="plotly_dark",
+            legend={"orientation": "h", "y": -0.20},
+            margin={"l": 65, "r": 25, "t": 65, "b": 90},
+        )
+
+        gap_colors = [
+            "#ef4444" if value > 0 else "#22c55e"
+            for value in repricing["gap_bps"]
+        ]
+        rich_cheap_fig = go.Figure(go.Bar(
+            x=repricing["tenor"],
+            y=repricing["gap_bps"],
+            marker_color=gap_colors,
+            text=[
+                f"{value:+.1f} bp"
+                for value in repricing["gap_bps"]
+            ],
+            textposition="outside",
+        ))
+        rich_cheap_fig.add_hline(y=0, line_width=1)
+        rich_cheap_fig.update_layout(
+            title="Scenario fair value minus market",
+            xaxis_title="Tenor",
+            yaxis_title="Basis points",
+            height=340,
+            template="plotly_dark",
+            margin={"l": 65, "r": 25, "t": 65, "b": 60},
+        )
+
+        trade = self.trade.iloc[0]
+        summary = widgets.HTML(f"""
+        <div style="
+            border:1px solid #555;
+            border-radius:9px;
+            padding:18px;
+            margin:12px 0;
+            min-height:265px;
+        ">
+          <div style="font-size:20px;font-weight:700;margin-bottom:14px;">
+            Selected Trade
+          </div>
+          <table style="width:100%;font-size:15px;line-height:1.8;">
+            <tr><td style="color:#aaa;">Trade</td>
+                <td><b>{self.direction.value} {self.trade_tenor.value}
+                {c.instrument_name}</b></td></tr>
+            <tr><td style="color:#aaa;">Notional</td>
+                <td>{c.currency} {self.notional.value:,.0f}</td></tr>
+            <tr><td style="color:#aaa;">Market rate</td>
+                <td>{trade['market_rate_pct']:.4f}%</td></tr>
+            <tr><td style="color:#aaa;">Scenario fair</td>
+                <td>{trade['scenario_fair_rate_pct']:.4f}%</td></tr>
+            <tr><td style="color:#aaa;">Fair-value gap</td>
+                <td><b>{trade['scenario_minus_market_bps']:+.2f} bp</b></td></tr>
+            <tr><td style="color:#aaa;">DV01</td>
+                <td>{c.currency} {trade['dv01_per_bp']:,.0f}/bp</td></tr>
+            <tr><td style="color:#aaa;">Scenario P&amp;L</td>
+                <td><b>{c.currency} {trade['scenario_pv']:,.0f}</b></td></tr>
+            <tr><td style="color:#aaa;">Signal</td>
+                <td><b>{trade['trade_signal']}</b></td></tr>
+          </table>
+        </div>
+        """)
+
+        path_out = widgets.Output()
+        rich_cheap_out = widgets.Output()
+
+        with path_out:
+            path_fig.show()
+        with rich_cheap_out:
+            rich_cheap_fig.show()
+
+        with self.scenario_out:
+            clear_output()
+            display(widgets.HBox(
+                [path_out, summary],
+                layout=widgets.Layout(
+                    grid_gap="18px",
+                    align_items="stretch",
+                ),
+            ))
+            display(rich_cheap_out)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    def render_diagnostics(self):
+        c = self.config
+        diagnostics = self.diagnostics.copy()
+
+        curve_fit = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            row_heights=[0.72, 0.28],
+            vertical_spacing=0.08,
+            subplot_titles=(
+                "Observed market curve versus model reconstruction",
+                "Calibration residuals",
+            ),
+        )
+        curve_fit.add_trace(go.Scatter(
+            x=diagnostics["tenor"],
+            y=diagnostics["market_rate"],
+            mode="markers",
+            name="Observed market",
+            marker={"size": 10, "color": "#38bdf8"},
+        ), row=1, col=1)
+        curve_fit.add_trace(go.Scatter(
+            x=diagnostics["tenor"],
+            y=diagnostics["model_rate"],
+            mode="lines+markers",
+            name="Model rebuilt",
+            line={"width": 2, "dash": "dash", "color": "#facc15"},
+        ), row=1, col=1)
+        curve_fit.add_trace(go.Bar(
+            x=diagnostics["tenor"],
+            y=diagnostics["error_bps"],
+            name="Residual",
+            marker_color=[
+                "#ef4444" if value > 0 else "#22c55e"
+                for value in diagnostics["error_bps"]
+            ],
+        ), row=2, col=1)
+        curve_fit.add_hline(y=0, row=2, col=1, line_width=1)
+
+        curve_fit.update_yaxes(
+            title_text="Par rate (%)",
+            row=1,
+            col=1,
+        )
+        curve_fit.update_yaxes(
+            title_text="Error (bp)",
+            row=2,
+            col=1,
+        )
+        curve_fit.update_layout(
+            height=620,
+            template="plotly_dark",
+            legend={"orientation": "h", "y": -0.08},
+            margin={"l": 70, "r": 30, "t": 80, "b": 75},
+        )
+
+        with self.diagnostics_out:
+            clear_output()
+            display(HTML(f"""
+            <h3>Curve Fit and Calibration Diagnostics</h3>
+            <div style="color:#aaa;margin-bottom:10px;">
+              Allocation method: <b>{self.calibration_method.value}</b> ·
+              Calibration tenors: {", ".join(c.calibration_tenors)} ·
+              Validation tenors: {", ".join(c.validation_tenors) or "None"} ·
+              RMSE: {self.metrics['rmse_bps']:.2f} bp ·
+              Maximum error: {self.metrics['max_abs_error_bps']:.2f} bp
+            </div>
+            """))
+            curve_fit.show()
+
+            display(diagnostics.style.format({
+                "market_rate": "{:.5f}",
+                "model_rate": "{:.5f}",
+                "error_bps": "{:+.2f}",
+            }))
+
+            if c.wipr_benchmark:
+                benchmark = pd.DataFrame(
+                    c.wipr_benchmark,
+                    columns=[
+                        "meeting_date",
+                        "wipr_move_bps",
+                        "wipr_implied_rate",
+                    ],
+                )
+                benchmark["meeting_date"] = pd.to_datetime(
+                    benchmark["meeting_date"]
+                )
+                comparison = self.path[
+                    [
+                        "meeting_date",
+                        "move_bps_raw",
+                        "post_overnight_rate",
+                    ]
+                ].merge(
+                    benchmark,
+                    on="meeting_date",
+                    how="inner",
+                )
+                comparison["move_difference_bps"] = (
+                    comparison["move_bps_raw"]
+                    - comparison["wipr_move_bps"]
+                )
+                comparison["rate_difference_bps"] = (
+                    comparison["post_overnight_rate"]
+                    - comparison["wipr_implied_rate"]
+                ) * 100.0
+
+                display(HTML("""
+                <h3 style="margin-top:24px;">Bloomberg WIPR Comparison</h3>
+                <div style="color:#aaa;margin-bottom:8px;">
+                  Benchmark values were transcribed from the supplied Bloomberg
+                  screenshot and are included for validation, not as model inputs.
+                </div>
+                """))
+                display(comparison.style.format({
+                    "move_bps_raw": "{:+.2f}",
+                    "post_overnight_rate": "{:.4f}",
+                    "wipr_move_bps": "{:+.2f}",
+                    "wipr_implied_rate": "{:.4f}",
+                    "move_difference_bps": "{:+.2f}",
+                    "rate_difference_bps": "{:+.2f}",
+                }))
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
+    def render_settings(self):
+        c = self.config
+        profile = CALIBRATION_PROFILES[self.calibration_method.value]
+
+        settings = pd.DataFrame({
+            "Item": [
+                "Country",
+                "Currency",
+                "Curve",
+                "Instrument",
+                "Policy ticker",
+                "Day count",
+                "Spot lag",
+                "Standard move",
+                "Calibration tenors",
+                "Validation tenors",
+                "Trade tenors",
+                "Allocation method",
+                "Smoothness penalty",
+                "Move-size penalty",
+                "Front-load penalty",
+                "Back-load penalty",
+                "Standard-move penalty",
+                "Notes",
+            ],
+            "Value": [
+                c.name,
+                c.currency,
+                c.curve_name,
+                c.instrument_name,
+                c.policy_ticker,
+                f"ACT/{c.day_count_basis}",
+                f"{c.spot_lag_days} day(s)",
+                f"{c.standard_move_bps:g} bp",
+                ", ".join(c.calibration_tenors),
+                ", ".join(c.validation_tenors),
+                ", ".join(c.trade_tenors),
+                self.calibration_method.value,
+                profile.smoothness_lambda,
+                profile.move_size_lambda,
+                profile.front_load_lambda,
+                profile.back_load_lambda,
+                profile.standard_move_lambda,
+                c.notes,
+            ],
+        })
+
+        quote_table = self.quotes[
+            ["tenor", "ticker", "par_rate", "tenor_days", "source"]
+        ].copy()
+
+        with self.settings_out:
+            clear_output()
+            display(HTML("<h3>Country Conventions and Assumptions</h3>"))
+            display(settings)
+            display(HTML("<h3 style='margin-top:24px;'>Market Inputs</h3>"))
+            display(quote_table.style.format({"par_rate": "{:.5f}"}))
+
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
+    def display(self):
+        display(Markdown("""
+# Global EM Implied Monetary Policy Pricer
+
+**Overview** shows market pricing. **Scenario** reprices a trader view.
+**Diagnostics** tests the curve fit. **Settings** exposes country conventions
+and model assumptions.
+"""))
+        display(self.top_controls)
+        display(self.tabs)
+
+
+# The notebook creates one instance explicitly.
+
+
+# =============================================================================
+# 5. OPTIONAL NOTEBOOK LAUNCH
+# =============================================================================
+
+def launch_dashboard(refresh: bool = True) -> GlobalEMPolicyPricer:
+    """Create, display and run the dashboard in a BQuant/Jupyter notebook."""
+    dashboard = GlobalEMPolicyPricer()
+    dashboard.display()
+    dashboard.run(refresh=refresh)
+    return dashboard
+
+
+# In a notebook, run either:
+#
+#     dashboard = launch_dashboard(refresh=True)
+#
+# or:
+#
+#     dashboard = GlobalEMPolicyPricer()
+#     dashboard.display()
+#     dashboard.run(refresh=True)
+
