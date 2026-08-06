@@ -1,0 +1,942 @@
+# 
+# # Global EM WIRP-Style Implied Monetary Policy Pricer
+# ### BQuant single-notebook version
+# 
+# This notebook uses **live Bloomberg curve objects**, constructs discount factors, and calculates **meeting-to-meeting forward overnight rates on the actual central-bank meeting dates**. It then converts each incremental rate change into the number of standard hikes/cuts priced, producing a WIRP-style line + bar view.
+# 
+# Initial markets:
+# - Mexico — `YCSW0583 Index`
+# - Chile — `YCSW0193 Index`
+# - Colombia — `YCSW0329 Index`
+# - Hungary — `YCSW0324 Index`
+# - Czech Republic — `YCSW0551 Index`
+# - Poland — `YCSW0327 Index`
+# - Turkey — `YCSW0522 Index`
+# 
+# **Important:** Bloomberg does not expose the FWCV arbitrary-date calculation as an obvious BQL data item. This notebook therefore uses Bloomberg curve-object quotes and Bloomberg's published forward-rate identity. Mexico conventions are configured more specifically; the other countries are parameterized and visibly marked for desk validation.
+
+
+# %%
+
+# ============================================================
+# BLOCK 1 — Imports
+# ============================================================
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import brentq
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import ipywidgets as widgets
+from IPython.display import HTML as DisplayHTML, clear_output, display
+
+try:
+    import bql
+except Exception:
+    bql = None
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 2 — Country configuration
+# ============================================================
+
+@dataclass(frozen=True)
+class CountryConfig:
+    name: str
+    code: str
+    currency: str
+    central_bank: str
+    curve_ticker: str
+
+    # Live policy ticker is optional. Unknown tickers are NOT guessed.
+    policy_ticker: Optional[str]
+
+    policy_rate_fallback: float
+    effective_rate_fallback: float
+    standard_move_bps: float
+
+    # Curve-pricing conventions. These are explicit so they can be changed.
+    day_count_basis: int
+    fixed_payment_frequency_days: int
+    spot_lag_days: int
+    convention_status: str
+
+    official_meetings: tuple[pd.Timestamp, ...]
+    estimated_cadence_days: int
+    horizon_days: int = 730
+
+
+def _dates(items):
+    return tuple(pd.to_datetime(items))
+
+
+COUNTRIES = {
+    "Mexico": CountryConfig(
+        name="Mexico", code="MX", currency="MXN",
+        central_bank="Banco de México",
+        curve_ticker="YCSW0583 Index",
+        policy_ticker="MXONBR Index",
+        policy_rate_fallback=6.50,
+        effective_rate_fallback=6.55,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=28,
+        spot_lag_days=2,
+        convention_status="Mexico TIIE-F MVP: 28D fixed leg, ACT/360; validate holiday/payment adjustment with desk.",
+        official_meetings=_dates([
+            "2026-08-06", "2026-09-24", "2026-11-05", "2026-12-17",
+        ]),
+        estimated_cadence_days=46,
+    ),
+    "Chile": CountryConfig(
+        name="Chile", code="CL", currency="CLP",
+        central_bank="Banco Central de Chile",
+        curve_ticker="YCSW0193 Index",
+        policy_ticker=None,
+        policy_rate_fallback=4.50,
+        effective_rate_fallback=4.50,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype OIS convention: annual fixed / ACT360. Confirm exact Bloomberg curve defaults with desk.",
+        official_meetings=_dates([
+            "2026-09-08", "2026-10-27", "2026-12-15",
+        ]),
+        estimated_cadence_days=45,
+    ),
+    "Colombia": CountryConfig(
+        name="Colombia", code="CO", currency="COP",
+        central_bank="Banco de la República",
+        curve_ticker="YCSW0329 Index",
+        policy_ticker=None,
+        policy_rate_fallback=12.00,
+        effective_rate_fallback=12.00,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype OIS convention: annual fixed / ACT360. Future 2026 meeting dates estimated until desk calendar is supplied.",
+        official_meetings=tuple(),
+        estimated_cadence_days=45,
+    ),
+    "Hungary": CountryConfig(
+        name="Hungary", code="HU", currency="HUF",
+        central_bank="Magyar Nemzeti Bank",
+        curve_ticker="YCSW0324 Index",
+        policy_ticker=None,
+        policy_rate_fallback=5.75,
+        effective_rate_fallback=5.75,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype OIS convention: annual fixed / ACT360. Confirm exact HUF OIS defaults with desk.",
+        official_meetings=_dates([
+            "2026-08-25", "2026-09-22", "2026-10-20",
+            "2026-11-17", "2026-12-15",
+        ]),
+        estimated_cadence_days=35,
+    ),
+    "Czech Republic": CountryConfig(
+        name="Czech Republic", code="CZ", currency="CZK",
+        central_bank="Czech National Bank",
+        curve_ticker="YCSW0551 Index",
+        policy_ticker=None,
+        policy_rate_fallback=3.75,
+        effective_rate_fallback=3.27,
+        standard_move_bps=25.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype OIS convention: annual fixed / ACT360. Confirm exact CZK curve defaults with desk.",
+        official_meetings=_dates([
+            "2026-08-06", "2026-09-17", "2026-11-05", "2026-12-17",
+        ]),
+        estimated_cadence_days=45,
+    ),
+    "Poland": CountryConfig(
+        name="Poland", code="PL", currency="PLN",
+        central_bank="Narodowy Bank Polski",
+        curve_ticker="YCSW0327 Index",
+        policy_ticker=None,
+        policy_rate_fallback=3.75,
+        effective_rate_fallback=3.82,
+        standard_move_bps=25.0,
+        day_count_basis=365,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype OIS convention: annual fixed / ACT365. Confirm exact PLN OIS defaults with desk.",
+        official_meetings=_dates([
+            "2026-09-02", "2026-10-07", "2026-11-04", "2026-12-02",
+        ]),
+        estimated_cadence_days=35,
+    ),
+    "Turkey": CountryConfig(
+        name="Turkey", code="TR", currency="TRY",
+        central_bank="Central Bank of the Republic of Türkiye",
+        curve_ticker="YCSW0522 Index",
+        policy_ticker="TUBR1WRA Index",
+        policy_rate_fallback=37.00,
+        effective_rate_fallback=37.00,
+        standard_move_bps=250.0,
+        day_count_basis=360,
+        fixed_payment_frequency_days=365,
+        spot_lag_days=2,
+        convention_status="Prototype TLREF OIS convention: annual fixed / ACT360. Confirm exact Bloomberg curve defaults with desk.",
+        official_meetings=_dates([
+            "2026-09-10", "2026-10-22", "2026-12-10",
+            "2027-01-21", "2027-03-18", "2027-04-22", "2027-06-10",
+        ]),
+        estimated_cadence_days=45,
+    ),
+}
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 3 — Bloomberg BQL live curve-object loader
+# ============================================================
+
+@dataclass
+class MarketSnapshot:
+    curve: pd.DataFrame
+    policy_rate: float
+    policy_source: str
+    curve_source: str
+    quote_date: pd.Timestamp
+    as_of_date: pd.Timestamp
+
+
+class BloombergMarketData:
+
+    @staticmethod
+    def service():
+        if bql is None:
+            raise RuntimeError("BQL is unavailable. Run inside Bloomberg BQuant.")
+        return bql.Service()
+
+    @staticmethod
+    def _find_col(df, names):
+        lower = {str(c).lower(): c for c in df.columns}
+        for name in names:
+            if name.lower() in lower:
+                return lower[name.lower()]
+        for c in df.columns:
+            lc = str(c).lower()
+            if any(name.lower() in lc for name in names):
+                return c
+        return None
+
+    @classmethod
+    def _merge_responses(cls, responses, context):
+        frames = [r.df().reset_index() for r in responses if not r.df().empty]
+        if not frames:
+            raise RuntimeError(f"No Bloomberg data returned for {context}.")
+        if len(frames) == 1:
+            return frames[0]
+
+        out = frames[0]
+        for nxt in frames[1:]:
+            shared = [c for c in ("ID", "DATE", "ID_DATE") if c in out.columns and c in nxt.columns]
+            if not shared and "ID" in out.columns and "ID" in nxt.columns:
+                shared = ["ID"]
+            if not shared:
+                raise RuntimeError(
+                    f"Cannot merge BQL response tables for {context}: "
+                    f"{list(out.columns)} / {list(nxt.columns)}"
+                )
+            out = out.merge(nxt.drop_duplicates(shared), on=shared, how="outer", suffixes=("", "_dup"))
+            for c in [x for x in out.columns if str(x).endswith("_dup")]:
+                base = str(c)[:-4]
+                if base in out.columns:
+                    out[base] = out[base].where(out[base].notna(), out[c])
+                out.drop(columns=[c], inplace=True)
+        return out
+
+    @classmethod
+    def load_curve(cls, config: CountryConfig, as_of: pd.Timestamp):
+        svc = cls.service()
+        selected = pd.Timestamp(as_of).normalize()
+        today = pd.Timestamp.today().normalize()
+
+        universe = svc.univ.curvemembers(symbols=config.curve_ticker)
+
+        if selected >= today:
+            rate_item = svc.data.curve_rate(side="MID")
+            source = f"Live BQL curve object {config.curve_ticker}"
+        else:
+            date_text = selected.strftime("%Y-%m-%d")
+            try:
+                rate_item = svc.data.curve_rate(side="MID", dates=date_text)
+            except Exception:
+                rate_item = svc.data.curve_rate(side="MID", dates=selected)
+            source = f"Historical BQL curve object {config.curve_ticker}"
+
+        req = bql.Request(
+            universe,
+            {
+                "curve_rate": rate_item,
+                "maturity": svc.data.maturity(),
+            },
+        )
+        raw = cls._merge_responses(svc.execute(req), config.curve_ticker)
+
+        id_col = cls._find_col(raw, ["ID", "ticker"])
+        rate_col = cls._find_col(raw, ["curve_rate", "rate"])
+        mat_col = cls._find_col(raw, ["maturity"])
+        date_col = cls._find_col(raw, ["DATE", "ID_DATE"])
+
+        if id_col is None or rate_col is None:
+            raise RuntimeError(f"Unexpected BQL curve response columns: {list(raw.columns)}")
+
+        frame = pd.DataFrame({
+            "ticker": raw[id_col].astype(str),
+            "par_rate": pd.to_numeric(raw[rate_col], errors="coerce"),
+        })
+
+        # Some BQuant releases do not return maturity for curve members.
+        if mat_col is not None:
+            frame["maturity"] = pd.to_datetime(raw[mat_col], errors="coerce")
+            frame["tenor_days"] = (frame["maturity"] - selected).dt.days
+        else:
+            raise RuntimeError(
+                "Curve member maturity was not returned. "
+                "Please verify bq.data.maturity() works for this curve object."
+            )
+
+        frame["quote_date"] = selected
+        if date_col is not None:
+            parsed = pd.to_datetime(raw[date_col], errors="coerce")
+            frame["quote_date"] = parsed.fillna(selected).dt.normalize()
+
+        frame = frame.dropna(subset=["par_rate", "tenor_days"])
+        frame = frame[(frame["tenor_days"] > 0) & (frame["tenor_days"] <= 10 * 365)]
+        frame = frame.sort_values("tenor_days").drop_duplicates("tenor_days")
+
+        if len(frame) < 5:
+            raise RuntimeError(f"Only {len(frame)} usable curve nodes returned for {config.name}.")
+
+        frame["source"] = source
+        return frame.reset_index(drop=True)
+
+    @classmethod
+    def load_policy(cls, config: CountryConfig, as_of: pd.Timestamp):
+        if not config.policy_ticker:
+            return config.policy_rate_fallback, "Editable configured fallback"
+
+        svc = cls.service()
+        selected = pd.Timestamp(as_of).normalize()
+        today = pd.Timestamp.today().normalize()
+
+        if selected >= today:
+            item = svc.data.px_last()
+            source = f"Live BQL {config.policy_ticker}"
+        else:
+            date_text = selected.strftime("%Y-%m-%d")
+            try:
+                item = svc.data.px_last(dates=date_text)
+            except Exception:
+                item = svc.data.px_last(dates=selected)
+            source = f"Historical BQL {config.policy_ticker}"
+
+        try:
+            req = bql.Request([config.policy_ticker], {"policy": item})
+            raw = cls._merge_responses(svc.execute(req), config.policy_ticker)
+            val_col = cls._find_col(raw, ["policy", "px_last", "value"])
+            vals = pd.to_numeric(raw[val_col], errors="coerce").dropna()
+            if not vals.empty:
+                return float(vals.iloc[-1]), source
+        except Exception:
+            pass
+
+        return config.policy_rate_fallback, "Editable configured fallback"
+
+    @classmethod
+    def snapshot(cls, config: CountryConfig, as_of: pd.Timestamp):
+        curve = cls.load_curve(config, as_of)
+        policy, policy_source = cls.load_policy(config, as_of)
+        qd = pd.to_datetime(curve["quote_date"], errors="coerce").dropna()
+        quote_date = qd.max() if not qd.empty else pd.Timestamp(as_of).normalize()
+        return MarketSnapshot(
+            curve=curve,
+            policy_rate=policy,
+            policy_source=policy_source,
+            curve_source=str(curve["source"].iloc[0]),
+            quote_date=pd.Timestamp(quote_date).normalize(),
+            as_of_date=pd.Timestamp(as_of).normalize(),
+        )
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 4 — Calendar builder: official dates + estimated extension
+# ============================================================
+
+def following_weekday(d):
+    d = pd.Timestamp(d).normalize()
+    while d.weekday() >= 5:
+        d += pd.Timedelta(days=1)
+    return d
+
+
+def build_calendar(config: CountryConfig, as_of: pd.Timestamp, extend=True):
+    as_of = pd.Timestamp(as_of).normalize()
+    end = as_of + pd.Timedelta(days=config.horizon_days)
+
+    official = sorted(
+        pd.Timestamp(d).normalize()
+        for d in config.official_meetings
+        if as_of < pd.Timestamp(d).normalize() <= end
+    )
+
+    rows = [{"meeting_date": d, "meeting_type": "Official"} for d in official]
+    used = set(official)
+
+    if extend:
+        anchor = official[-1] if official else as_of
+        next_d = anchor + pd.Timedelta(days=config.estimated_cadence_days)
+
+        while next_d <= end:
+            est = following_weekday(next_d)
+            while est in used:
+                est = following_weekday(est + pd.Timedelta(days=1))
+            rows.append({"meeting_date": est, "meeting_type": "Estimated"})
+            used.add(est)
+            next_d = est + pd.Timedelta(days=config.estimated_cadence_days)
+
+    cal = pd.DataFrame(rows).sort_values("meeting_date").reset_index(drop=True)
+    if cal.empty:
+        raise ValueError(f"No future meeting dates for {config.name}.")
+    cal["days_from_as_of"] = (cal["meeting_date"] - as_of).dt.days
+    return cal
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 5 — Discount-curve bootstrap
+# ============================================================
+
+@dataclass
+class DiscountCurve:
+    node_days: np.ndarray
+    node_dfs: np.ndarray
+    log_df_interp: PchipInterpolator
+    config: CountryConfig
+    nodes: pd.DataFrame
+
+    def df(self, day):
+        day = float(day)
+        if day <= 0:
+            return 1.0
+        if day > self.node_days[-1]:
+            raise ValueError(
+                f"Requested day {day:.0f} exceeds available curve horizon "
+                f"{self.node_days[-1]:.0f}."
+            )
+        return float(np.exp(self.log_df_interp(day)))
+
+
+def _payment_schedule(maturity_day, frequency_days):
+    if maturity_day <= frequency_days:
+        return [int(maturity_day)]
+    dates = list(range(frequency_days, int(maturity_day), frequency_days))
+    dates.append(int(maturity_day))
+    return dates
+
+
+def bootstrap_discount_curve(market_curve: pd.DataFrame, config: CountryConfig):
+    quotes = (
+        market_curve[["ticker", "par_rate", "tenor_days"]]
+        .dropna()
+        .sort_values("tenor_days")
+        .drop_duplicates("tenor_days")
+    )
+
+    node_days = [0.0]
+    node_dfs = [1.0]
+    output = []
+
+    def interp_df(day, candidate_day=None, candidate_df=None):
+        days = np.asarray(node_days, float)
+        dfs = np.asarray(node_dfs, float)
+        if candidate_day is not None:
+            days = np.r_[days, float(candidate_day)]
+            dfs = np.r_[dfs, float(candidate_df)]
+        order = np.argsort(days)
+        return float(np.exp(np.interp(float(day), days[order], np.log(dfs[order]))))
+
+    for _, row in quotes.iterrows():
+        maturity = int(row["tenor_days"])
+        k = float(row["par_rate"]) / 100.0
+        schedule = _payment_schedule(maturity, config.fixed_payment_frequency_days)
+
+        def objective(last_df):
+            annuity = 0.0
+            prev = 0
+            for pay_day in schedule:
+                alpha = (pay_day - prev) / config.day_count_basis
+                annuity += alpha * interp_df(pay_day, maturity, last_df)
+                prev = pay_day
+            return k * annuity - (1.0 - last_df)
+
+        lower, upper = 1e-8, 2.0
+        try:
+            solved = brentq(objective, lower, upper, maxiter=500)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Bootstrap failed for {config.name} at node {maturity}d. "
+                "This usually means the configured swap convention needs adjustment."
+            ) from exc
+
+        node_days.append(float(maturity))
+        node_dfs.append(float(solved))
+        output.append({
+            "ticker": row["ticker"],
+            "tenor_days": maturity,
+            "market_par_rate": float(row["par_rate"]),
+            "discount_factor": float(solved),
+        })
+
+    interp = PchipInterpolator(
+        np.asarray(node_days),
+        np.log(np.asarray(node_dfs)),
+        extrapolate=False,
+    )
+    return DiscountCurve(
+        node_days=np.asarray(node_days),
+        node_dfs=np.asarray(node_dfs),
+        log_df_interp=interp,
+        config=config,
+        nodes=pd.DataFrame(output),
+    )
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 6 — WIRP-style meeting segment forwards
+# ============================================================
+
+def simple_forward_from_df(curve: DiscountCurve, start_day: int, end_day: int):
+    """
+    Bloomberg MIPR published identity:
+        D(0,end)/D(0,start) = 1 / (1 + r_f * t)
+
+    Rearranged:
+        r_f = (D(0,start)/D(0,end) - 1) / t
+    """
+    if end_day <= start_day:
+        raise ValueError("Forward interval must have positive length.")
+
+    d1 = curve.df(start_day)
+    d2 = curve.df(end_day)
+    t = (end_day - start_day) / curve.config.day_count_basis
+    return ((d1 / d2) - 1.0) / t * 100.0
+
+
+def build_wirp_path(
+    curve: DiscountCurve,
+    calendar: pd.DataFrame,
+    effective_rate: float,
+    policy_rate: float,
+    config: CountryConfig,
+):
+    """
+    For every meeting, calculate the forward overnight rate for the period
+    AFTER that meeting and BEFORE the next meeting.
+
+    First meeting move:
+        implied post-meeting rate - current effective rate
+
+    Later moves:
+        implied rate_i - implied rate_(i-1)
+    """
+    cal = calendar.copy().sort_values("meeting_date").reset_index(drop=True)
+
+    # Need an endpoint after the final displayed meeting.
+    next_days = cal["days_from_as_of"].astype(int).tolist()[1:]
+    final_end = int(cal["days_from_as_of"].iloc[-1] + config.estimated_cadence_days)
+    next_days.append(final_end)
+
+    max_curve_day = int(curve.node_days[-1])
+    if final_end > max_curve_day:
+        # Keep only meetings whose post-meeting interval fits inside the curve.
+        valid = [
+            i for i, end_day in enumerate(next_days)
+            if end_day <= max_curve_day
+        ]
+        if not valid:
+            raise ValueError("Curve horizon is too short for the first meeting interval.")
+        last_i = max(valid)
+        cal = cal.iloc[:last_i + 1].copy()
+        next_days = next_days[:last_i + 1]
+
+    implied_overnight = []
+    for start_day, end_day in zip(
+        cal["days_from_as_of"].astype(int),
+        next_days,
+    ):
+        start = max(int(start_day) + config.spot_lag_days, 1)
+        end = max(int(end_day) + config.spot_lag_days, start + 1)
+        implied_overnight.append(simple_forward_from_df(curve, start, end))
+
+    cal["implied_overnight_rate"] = implied_overnight
+
+    previous_rates = np.r_[
+        float(effective_rate),
+        cal["implied_overnight_rate"].to_numpy()[:-1],
+    ]
+    cal["implied_move_bps"] = (
+        cal["implied_overnight_rate"].to_numpy() - previous_rates
+    ) * 100.0
+
+    cal["hikes_cuts"] = cal["implied_move_bps"] / config.standard_move_bps
+    cal["hike_cut_percent"] = cal["hikes_cuts"] * 100.0
+    cal["implied_rate_delta"] = cal["implied_move_bps"] / 100.0
+
+    # Policy-equivalent rate: preserve today's policy-effective basis.
+    policy_effective_basis = float(policy_rate) - float(effective_rate)
+    cal["implied_policy_rate"] = (
+        cal["implied_overnight_rate"] + policy_effective_basis
+    )
+
+    cal["direction"] = np.select(
+        [cal["implied_move_bps"] > 0.5, cal["implied_move_bps"] < -0.5],
+        ["Hike", "Cut"],
+        default="Pause",
+    )
+
+    return cal
+
+
+
+# %%
+
+# ============================================================
+# BLOCK 7 — Dashboard
+# ============================================================
+
+class GlobalEMWIRP:
+
+    def __init__(self):
+        self.config = COUNTRIES["Mexico"]
+        self.snapshot = None
+        self.curve = None
+        self.calendar = None
+        self.path = None
+
+        self.country = widgets.Dropdown(
+            options=list(COUNTRIES),
+            value="Mexico",
+            description="Country:",
+            layout=widgets.Layout(width="240px"),
+        )
+        self.live = widgets.Checkbox(
+            value=True, description="Live Bloomberg", indent=False
+        )
+        self.as_of = widgets.DatePicker(
+            value=pd.Timestamp.today().date(),
+            description="Historical:",
+            disabled=True,
+            layout=widgets.Layout(width="240px"),
+        )
+        self.extend = widgets.Checkbox(
+            value=True,
+            description="Extend estimated meetings to 2Y",
+            indent=False,
+        )
+        self.policy = widgets.FloatText(
+            value=self.config.policy_rate_fallback,
+            description="Policy:",
+            layout=widgets.Layout(width="180px"),
+        )
+        self.effective = widgets.FloatText(
+            value=self.config.effective_rate_fallback,
+            description="Effective:",
+            layout=widgets.Layout(width="190px"),
+        )
+        self.refresh = widgets.Button(
+            description="Refresh live Bloomberg",
+            button_style="info",
+            icon="refresh",
+        )
+
+        self.status = widgets.Output()
+        self.main = widgets.Output()
+        self.curve_out = widgets.Output()
+        self.method = widgets.Output()
+
+        self.tabs = widgets.Tab(children=[
+            widgets.VBox([self.main]),
+            widgets.VBox([self.curve_out]),
+            widgets.VBox([self.method]),
+        ])
+        self.tabs.set_title(0, "WIRP View")
+        self.tabs.set_title(1, "Curve Diagnostics")
+        self.tabs.set_title(2, "Methodology")
+
+        self.root = widgets.VBox([
+            widgets.HTML("<h2>Global EM WIRP-Style Policy Pricer</h2>"),
+            widgets.HBox([
+                self.country, self.live, self.as_of, self.extend, self.refresh
+            ]),
+            widgets.HBox([self.policy, self.effective]),
+            self.status,
+            self.tabs,
+        ])
+
+        self.country.observe(self._country_changed, names="value")
+        self.live.observe(self._live_changed, names="value")
+        self.extend.observe(lambda _: self.run(refresh=False), names="value")
+        self.refresh.on_click(lambda _: self.run(refresh=True))
+
+    def display(self):
+        display(self.root)
+
+    def _selected_date(self):
+        if self.live.value:
+            today = pd.Timestamp.today().normalize()
+            self.as_of.value = today.date()
+            return today
+        return pd.Timestamp(self.as_of.value).normalize()
+
+    def _country_changed(self, change):
+        self.config = COUNTRIES[change["new"]]
+        self.policy.value = self.config.policy_rate_fallback
+        self.effective.value = self.config.effective_rate_fallback
+        self.snapshot = None
+        self.run(refresh=True)
+
+    def _live_changed(self, change):
+        self.as_of.disabled = bool(change["new"])
+        self.refresh.description = (
+            "Refresh live Bloomberg" if change["new"]
+            else "Load historical Bloomberg"
+        )
+        self.snapshot = None
+        self.run(refresh=True)
+
+    def run(self, refresh=True):
+        try:
+            selected = self._selected_date()
+
+            if refresh or self.snapshot is None:
+                self.snapshot = BloombergMarketData.snapshot(self.config, selected)
+
+                # If a verified live policy ticker exists, populate it.
+                if "Live BQL" in self.snapshot.policy_source or "Historical BQL" in self.snapshot.policy_source:
+                    self.policy.value = float(self.snapshot.policy_rate)
+
+            self.calendar = build_calendar(
+                self.config, selected, extend=self.extend.value
+            )
+            self.curve = bootstrap_discount_curve(
+                self.snapshot.curve, self.config
+            )
+            self.path = build_wirp_path(
+                self.curve,
+                self.calendar,
+                effective_rate=float(self.effective.value),
+                policy_rate=float(self.policy.value),
+                config=self.config,
+            )
+
+            self._render_status()
+            self._render_main()
+            self._render_curve()
+            self._render_method()
+
+        except Exception as exc:
+            with self.status:
+                clear_output()
+                display(DisplayHTML(
+                    f"<div style='color:#ff6666;font-family:monospace'>"
+                    f"<b>ERROR:</b> {type(exc).__name__}: {exc}</div>"
+                ))
+            raise
+
+    def _render_status(self):
+        with self.status:
+            clear_output()
+            display(DisplayHTML(
+                f"<div style='color:#aaa;font-size:12px'>"
+                f"<b>{self.config.name}</b> · "
+                f"Curve: {self.config.curve_ticker} · "
+                f"Source: {self.snapshot.curve_source} · "
+                f"Curve date: {self.snapshot.quote_date.date()} · "
+                f"Policy source: {self.snapshot.policy_source}"
+                f"</div>"
+            ))
+
+    def _render_main(self):
+        with self.main:
+            clear_output()
+
+            p = self.path
+            next_row = p.iloc[0]
+
+            display(DisplayHTML(f"""
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin:10px 0">
+              <div style="background:#222;border:1px solid #555;border-radius:8px;padding:12px;min-width:170px">
+                <span style="color:#aaa;font-size:11px">TARGET / POLICY RATE</span>
+                <b style="display:block;font-size:22px">{self.policy.value:.3f}%</b>
+              </div>
+              <div style="background:#222;border:1px solid #555;border-radius:8px;padding:12px;min-width:170px">
+                <span style="color:#aaa;font-size:11px">EFFECTIVE RATE</span>
+                <b style="display:block;font-size:22px">{self.effective.value:.3f}%</b>
+              </div>
+              <div style="background:#222;border:1px solid #555;border-radius:8px;padding:12px;min-width:170px">
+                <span style="color:#aaa;font-size:11px">NEXT MEETING</span>
+                <b style="display:block;font-size:22px">{next_row["hike_cut_percent"]:+.1f}%</b>
+                <small>{pd.Timestamp(next_row["meeting_date"]).date()}</small>
+              </div>
+              <div style="background:#222;border:1px solid #555;border-radius:8px;padding:12px;min-width:190px">
+                <span style="color:#aaa;font-size:11px">CURRENT IMPLIED O/N</span>
+                <b style="display:block;font-size:22px">{next_row["implied_overnight_rate"]:.3f}%</b>
+              </div>
+            </div>
+            """))
+
+            colors = np.where(p["hikes_cuts"] >= 0, "#ffa726", "#ef5350")
+
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(
+                go.Scatter(
+                    x=["Current"] + list(p["meeting_date"]),
+                    y=[float(self.effective.value)] + list(p["implied_overnight_rate"]),
+                    mode="lines+markers",
+                    name="Implied Overnight Rate (%)",
+                    line=dict(width=3),
+                ),
+                secondary_y=False,
+            )
+            fig.add_trace(
+                go.Bar(
+                    x=p["meeting_date"],
+                    y=p["hikes_cuts"],
+                    marker_color=colors,
+                    name="Number of Hikes/Cuts Priced In",
+                    text=[f"{x:+.3f}" for x in p["hikes_cuts"]],
+                    textposition="outside",
+                    opacity=0.85,
+                ),
+                secondary_y=True,
+            )
+            fig.update_yaxes(
+                title_text="Implied Overnight Rate (%)",
+                secondary_y=False,
+            )
+            fig.update_yaxes(
+                title_text="Number of Standard Hikes/Cuts",
+                secondary_y=True,
+            )
+            fig.update_layout(
+                title=f"{self.config.name}: Implied Overnight Rate & Number of Hikes/Cuts",
+                template="plotly_dark",
+                height=600,
+                legend=dict(orientation="h"),
+                hovermode="x unified",
+            )
+            fig.show()
+
+            table = p[[
+                "meeting_date",
+                "hikes_cuts",
+                "hike_cut_percent",
+                "implied_rate_delta",
+                "implied_overnight_rate",
+                "implied_policy_rate",
+                "meeting_type",
+            ]].copy()
+            table.columns = [
+                "Meeting", "# Hikes/Cuts", "% Hike/Cut",
+                "Imp. Rate Δ", "Implied O/N Rate",
+                "Implied Policy Rate", "Type"
+            ]
+            table["Meeting"] = pd.to_datetime(table["Meeting"]).dt.date
+            for c in ["# Hikes/Cuts", "% Hike/Cut", "Imp. Rate Δ",
+                      "Implied O/N Rate", "Implied Policy Rate"]:
+                table[c] = table[c].astype(float).round(3)
+
+            display(DisplayHTML("<h3>Meeting-by-Meeting Pricing</h3>"))
+            display(table)
+
+    def _render_curve(self):
+        with self.curve_out:
+            clear_output()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=self.snapshot.curve["tenor_days"],
+                y=self.snapshot.curve["par_rate"],
+                mode="lines+markers",
+                name="Bloomberg Curve Rate",
+            ))
+            fig.update_layout(
+                title=f"{self.config.name} — {self.config.curve_ticker}",
+                xaxis_title="Days to maturity",
+                yaxis_title="Par rate (%)",
+                template="plotly_dark",
+                height=420,
+            )
+            fig.show()
+
+            display(DisplayHTML("<h3>Live Bloomberg Curve Members</h3>"))
+            display(self.snapshot.curve.round(6))
+
+            display(DisplayHTML("<h3>Bootstrapped Discount Factors</h3>"))
+            display(self.curve.nodes.round(8))
+
+    def _render_method(self):
+        with self.method:
+            clear_output()
+            display(DisplayHTML(f"""
+            <h3>Methodology</h3>
+            <ol>
+              <li>Load live Bloomberg curve object <b>{self.config.curve_ticker}</b>.</li>
+              <li>Bootstrap discount factors from the curve's par rates using explicit country conventions.</li>
+              <li>Use the actual central-bank meeting dates rather than MIPR's 1M / 3M / 6M buckets.</li>
+              <li>For each meeting, compute the simple forward rate for the period from that meeting until the next meeting using Bloomberg's published MIPR identity:<br>
+              <code>r = (D(start)/D(end) - 1) / t</code></li>
+              <li>First-meeting pricing compares the implied post-meeting O/N rate with today's effective rate.</li>
+              <li>Subsequent meeting pricing compares successive implied post-meeting rates.</li>
+              <li>Divide the incremental basis-point move by the country's configured standard move to obtain # hikes/cuts.</li>
+            </ol>
+            <p><b>Convention status:</b> {self.config.convention_status}</p>
+            <p><b>Important:</b> Official meeting dates are used where configured. Dates marked Estimated are model assumptions and should not be presented as announced meetings.</p>
+            """))
+
+
+# 
+# ## Launch
+# 
+# Run all cells from the top, then run the final cell below.
+
+
+# %%
+
+# ============================================================
+# BLOCK 8 — Launch
+# ============================================================
+
+app = GlobalEMWIRP()
+app.display()
+app.run(refresh=True)
